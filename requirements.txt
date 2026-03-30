@@ -1,0 +1,7 @@
+st-gsheets-connection
+streamlit
+pandas
+gspread
+resend
+matplotlib
+seaborn

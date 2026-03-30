@@ -1,0 +1,14 @@
+id,brand_name,generic_name,expiry_date,stock_level,expected_monthly_use,order_level
+,Infanrix-Hexa,6-in-1,0328,11,28,9
+,Repevax,4-in-1,0427,18,8,3
+,Revaxis,3-in-1,,9,9,3
+,Rotarix,Rotavirus,0427,15,14,5
+,Bexero,Men B,0628,30,21,7
+,Prevenar13,Pneumococal13,0628,29,14,5
+,MMR,MMR,0626,8,5,2
+,MMRV,MMRV,0826,4,22,7
+,Gardasil9,HPV9,0826,9,2,1
+,MenQuadfi,MenACWY,,15,9,3
+,Menitorix,MenC/Hib,0326,50,0,0
+,Shingrix,Shingles,1027,22,10,3
+,Abrysvo,RSV,0726,12,10,3
