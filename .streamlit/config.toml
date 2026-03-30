@@ -19,11 +19,11 @@ headingFontSizes = ["48px", "32px", "24px", "20px", "17px", "14px"]
 headingFontWeights = [900, 900, 900, 900, 900, 900]
 chartCategoricalColors = ["#0c1722", "#ec5d4b", "#459bce", "#fae44c", "#ea39af", "#ea3c34", "#f3f8f3", "#5d6770", "#8fa6b1"]
 
-redColor = "#ae4f4d"
-orangeColor = "#ec5d4b"
-yellowColor = "#e4af6c"
-greenColor = "#a2a460"
-blueColor = "#659bb7"
+redColor = "#db6653"
+orangeColor = "#cba165"
+yellowColor = "#cba165"
+greenColor = "#989f96"
+blueColor = "#777f75"
 violetColor = "#db2777"
 grayColor = "#a3a3a3"
 

@@ -285,8 +285,8 @@ def hex_to_rgba(value: str, alpha: float) -> str:
 
 def render_title_banner() -> None:
     primary_color = st.get_option("theme.primaryColor") or "#ec5d4b"
-    text_color = st.get_option("theme.textColor") or "#0c1722"
-    banner_glow_color = "#ea39af"
+    banner_glow_color = "#f4f6f2"
+    banner_text_color = "#f4f6f2"
 
     banner_html = """
         <style>
@@ -303,7 +303,7 @@ def render_title_banner() -> None:
                 linear-gradient(135deg, #0c1722 0%, #12202e 62%, #1f3141 100%);
             border-radius: 24px;
             padding: 1.25rem 1.6rem 1rem 1.6rem;
-            color: white;
+            color: {banner_text_color};
             box-shadow: 0 18px 40px rgba(12, 23, 34, 0.18);
             margin-bottom: 1rem;
             margin-top: 0.5rem;
@@ -325,7 +325,7 @@ def render_title_banner() -> None:
             font-size: 0.9rem;
             letter-spacing: 0.08em;
             text-transform: uppercase;
-            color: #f3f8f3;
+            color: {banner_text_color};
             margin-bottom: 0.4rem;
             font-family: "Inter", sans-serif;
             font-weight: 800;
@@ -333,21 +333,21 @@ def render_title_banner() -> None:
         .hero-title {{
             margin: 0;
             font-family: "Inter", sans-serif;
-            font-size: 2.5rem;
+            font-size: 2.8rem;
             font-weight: 900;
             line-height: 1.05;
             letter-spacing: -0.04em;
             margin-bottom: 0.55rem;
-            color: white;
+            color: {banner_text_color};
         }}
         .hero-subtitle {{
             margin: 0;
-            font-size: 0.92rem;
+            font-size: 0.85rem;
             max-width: 58rem;
-            color: rgba(243, 248, 243, 0.92);
+            color: {banner_text_color};
             line-height: 1.45;
             font-family: "Inter", sans-serif;
-            font-weight: 500;
+            font-weight: 400;
         }}
         @media (max-width: 640px) {{
             .hero-card {{
@@ -367,14 +367,15 @@ def render_title_banner() -> None:
         </style>
 
         <section class="hero-card">
-            <div class="hero-kicker">StockVac - Stanhope Mews Surgery</div>
+            <div class="hero-kicker">Stanhope Mews Surgery</div>
             <h1 class="hero-title">StockVax</h1>
             <p class="hero-subtitle">
-                Live surgery vaccine inventory powered by Google Sheets, with clear reorder and expiry visibility.
+                Live surgery vaccine inventory powered by Google Sheets & Streamlit, with clear reorder and expiry visibility. Code by janduplessis883.
             </p>
         </section>
         """.format(
         primary_color=primary_color,
+        banner_text_color=banner_text_color,
         hero_glow=hex_to_rgba(banner_glow_color, 0.18),
     )
     st.html(banner_html)
@@ -390,7 +391,7 @@ def render_sidebar(conn: GSheetsConnection) -> None:
     )
 
     refresh_clicked = st.sidebar.button("Refresh from Google Sheet", width="stretch")
-    sample_clicked = st.sidebar.button("Load sample data locally", width="stretch")
+    sample_clicked = st.sidebar.button("Load sample data locally", width="stretch", disabled=True)
 
     st.sidebar.caption("Save writes the whole table back to Google Sheets, so avoid concurrent edits in multiple browser sessions.")
 
@@ -771,10 +772,10 @@ def render_nurse_tab(conn: GSheetsConnection, stock_df: pd.DataFrame) -> None:
             box-shadow: 0 4px 12px rgba(236, 93, 75, 0.14);
         }
         .nurse-expiry-pill.is-urgent {
-            background: rgba(219, 39, 119, 0.16);
-            border-color: rgba(219, 39, 119, 0.52);
-            color: #db2777;
-            box-shadow: 0 4px 12px rgba(219, 39, 119, 0.16);
+            background: rgba(211, 159, 90, 0.16);
+            border-color: rgba(211, 159, 90, 0.52);
+            color: #d39f5a;
+            box-shadow: 0 4px 12px rgba(211, 159, 90, 0.16);
         }
         </style>
         """
@@ -827,7 +828,7 @@ def render_nurse_tab(conn: GSheetsConnection, stock_df: pd.DataFrame) -> None:
                 detail_columns[1].metric(":gray[Order level]", f":gray[{order_level}]")
 
                 if stock_level <= 0:
-                    st.warning("Out of stock", icon=":material/error:")
+                    st.error("Out of stock", icon=":material/error:")
                 elif stock_level <= order_level and order_level > 0:
                     st.warning("Low stock", icon=":material/warning:")
                 else:
