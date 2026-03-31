@@ -472,10 +472,19 @@ def watchlist_row_styles(row: pd.Series, table_kind: str) -> list[str]:
 
 
 def styled_watchlist_table(df: pd.DataFrame, table_kind: str) -> pd.io.formats.style.Styler:
-    return df.style.apply(
+    styled = df.style.apply(
         lambda row: watchlist_row_styles(row, table_kind),
         axis=1,
     )
+    if "months_of_cover" in df.columns:
+        styled = styled.format(
+            {
+                "months_of_cover": lambda value: ""
+                if pd.isna(value)
+                else f"{float(value):.1f}"
+            }
+        )
+    return styled
 
 
 def render_stock_usage_plot(stock_df: pd.DataFrame) -> None:
@@ -568,7 +577,7 @@ def render_stock_usage_plot(stock_df: pd.DataFrame) -> None:
         .configure_view(strokeOpacity=0)
     )
 
-    st.altair_chart(chart, use_container_width=True)
+    st.altair_chart(chart, width="stretch")
 
 
 def render_overview(stock_df: pd.DataFrame) -> None:
