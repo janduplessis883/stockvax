@@ -2,18 +2,12 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import html
-import os
 from pathlib import Path
 import re
 
-MATPLOTLIB_CACHE_DIR = Path("/tmp/stockvax-matplotlib-cache")
-MATPLOTLIB_CACHE_DIR.mkdir(parents=True, exist_ok=True)
-os.environ.setdefault("MPLCONFIGDIR", str(MATPLOTLIB_CACHE_DIR))
-
-import matplotlib.pyplot as plt
+import altair as alt
 import numpy as np
 import pandas as pd
-import seaborn as sns
 import streamlit as st
 from streamlit_gsheets import GSheetsConnection
 
@@ -41,7 +35,7 @@ class StockSnapshot:
 
 
 st.set_page_config(page_title="StockVax", layout="wide")
-
+st.logo("data/logo.png", size="large")
 
 def normalize_column_name(name: str) -> str:
     normalized = re.sub(r"[^0-9a-zA-Z]+", "_", str(name).strip().lower())
@@ -217,7 +211,7 @@ def fetch_snapshot(conn: GSheetsConnection, worksheet_name: str | None) -> Stock
         return StockSnapshot(
             data=df,
             source_kind="google",
-            message="Live data loaded from Google Sheets.",
+            message=":material/database_upload: Live data loaded from Google Sheets.",
         )
     except Exception as exc:
         return StockSnapshot(
@@ -399,7 +393,7 @@ def render_sidebar(conn: GSheetsConnection) -> None:
         apply_snapshot(
             fetch_snapshot(conn, selected_worksheet_name()),
             flash_kind="info",
-            flash_message="Stock data refreshed from Google Sheets.",
+            flash_message=":material/refresh: Stock data refreshed from Google Sheets.",
         )
         st.rerun()
 
@@ -490,71 +484,91 @@ def render_stock_usage_plot(stock_df: pd.DataFrame) -> None:
         .sort_values("brand_name")
         .reset_index(drop=True)
     )
+    if plot_df.empty:
+        st.info("No stock data is available to plot yet.")
+        return
 
     primary_color = st.get_option("theme.primaryColor") or "#ec5d4b"
     text_color = st.get_option("theme.textColor") or "#0c1722"
     grid_color = st.get_option("theme.borderColor") or "#d7ded8"
     tick_color = "#7d8386"
-
-    sns.set_theme(style="whitegrid")
-    fig, ax = plt.subplots(figsize=(16, 5.4), dpi=180)
-
-    x_positions = np.arange(len(plot_df))
-    stock_values = plot_df["stock_level"].to_numpy(dtype=float)
-    expected_values = plot_df["expected_monthly_use"].to_numpy(dtype=float)
-
-    ax.bar(
-        x_positions,
-        stock_values,
-        width=0.76,
-        color=primary_color,
-        label="stock_level",
-        zorder=3,
-    )
-    ax.bar(
-        x_positions,
-        expected_values,
-        width=0.76,
-        bottom=stock_values,
-        color=text_color,
-        label="expected_monthly_use",
-        zorder=3,
+    long_plot_df = plot_df.rename(
+        columns={
+            "stock_level": "Stock level",
+            "expected_monthly_use": "Expected monthly use",
+        }
+    ).melt(
+        id_vars="brand_name",
+        value_vars=["Stock level", "Expected monthly use"],
+        var_name="series",
+        value_name="value",
     )
 
-    ax.set_title("Current stock vs expected monthly use", loc="left", fontsize=18, fontweight="bold", pad=12)
-    ax.set_xlabel("")
-    ax.set_ylabel("")
-    ax.set_xticks(x_positions)
-    ax.set_xticklabels(plot_df["brand_name"], rotation=90, ha="center", fontsize=9, color=tick_color)
-    ax.tick_params(axis="y", labelsize=10, colors=tick_color)
-    ax.tick_params(axis="x", length=0, pad=12)
-
-    ax.grid(axis="y", color=grid_color, linewidth=1, alpha=0.8)
-    ax.grid(axis="x", visible=False)
-    sns.despine(ax=ax, left=True, bottom=False)
-    ax.spines["bottom"].set_color(grid_color)
-    ax.spines["bottom"].set_linewidth(1)
-
-    handles, labels = ax.get_legend_handles_labels()
-    legend = ax.legend(
-        [handles[1], handles[0]],
-        [labels[1], labels[0]],
-        loc="upper left",
-        bbox_to_anchor=(0.01, -0.6),
-        ncol=2,
-        frameon=False,
-        fontsize=10,
-        handlelength=0.8,
-        handletextpad=0.4,
-        columnspacing=0.8,
+    chart = (
+        alt.Chart(long_plot_df)
+        .mark_bar(size=46)
+        .encode(
+            x=alt.X(
+                "brand_name:N",
+                sort=plot_df["brand_name"].tolist(),
+                axis=alt.Axis(
+                    title=None,
+                    labelAngle=-90,
+                    labelColor=tick_color,
+                    labelFontSize=11,
+                    labelPadding=10,
+                    ticks=False,
+                ),
+            ),
+            y=alt.Y(
+                "sum(value):Q",
+                title=None,
+                axis=alt.Axis(
+                    labelColor=tick_color,
+                    labelFontSize=11,
+                    gridColor=grid_color,
+                    domain=False,
+                    tickColor=grid_color,
+                ),
+            ),
+            color=alt.Color(
+                "series:N",
+                scale=alt.Scale(
+                    domain=["Stock level", "Expected monthly use"],
+                    range=[primary_color, text_color],
+                ),
+                legend=alt.Legend(
+                    title=None,
+                    orient="bottom",
+                    direction="horizontal",
+                    labelColor=tick_color,
+                    symbolType="square",
+                ),
+            ),
+            order=alt.Order(
+                "series:N",
+                sort="ascending",
+            ),
+            tooltip=[
+                alt.Tooltip("brand_name:N", title="Vaccine"),
+                alt.Tooltip("series:N", title="Series"),
+                alt.Tooltip("value:Q", title="Doses", format=".0f"),
+            ],
+        )
+        .properties(
+            title="Current stock vs expected monthly use",
+            height=420,
+        )
+        .configure_title(
+            anchor="start",
+            color=text_color,
+            fontSize=18,
+            fontWeight="bold",
+        )
+        .configure_view(strokeOpacity=0)
     )
-    for text in legend.get_texts():
-        text.set_color(tick_color)
 
-    ax.margins(x=0.02)
-    fig.tight_layout()
-    st.pyplot(fig, width="stretch")
-    plt.close(fig)
+    st.altair_chart(chart, use_container_width=True)
 
 
 def render_overview(stock_df: pd.DataFrame) -> None:
@@ -717,7 +731,13 @@ def give_vaccine_dose(conn: GSheetsConnection, vaccine_id: str) -> None:
 
 
 def render_nurse_tab(conn: GSheetsConnection, stock_df: pd.DataFrame) -> None:
-    render_stock_usage_plot(add_inventory_metrics(stock_df))
+    with st.expander("Stock usage bar plot", icon=":material/bar_chart:"):
+        render_stock_usage_plot(add_inventory_metrics(stock_df))
+    sort_by_brand_name = st.toggle(
+        "Sort by Brand Name",
+        value=False,
+        help="Off sorts the list by Generic Name.",
+    )
     st.subheader("Nurse recording")
     st.caption("Keep this tab open during clinic. One click records one vaccine given and updates the live stock level immediately.")
     st.html(
@@ -766,22 +786,23 @@ def render_nurse_tab(conn: GSheetsConnection, stock_df: pd.DataFrame) -> None:
             color: #d8ded8;
         }
         .nurse-expiry-pill.is-warning {
-            background: rgba(236, 93, 75, 0.14);
-            border-color: rgba(236, 93, 75, 0.52);
-            color: #ec5d4b;
-            box-shadow: 0 4px 12px rgba(236, 93, 75, 0.14);
-        }
-        .nurse-expiry-pill.is-urgent {
             background: rgba(211, 159, 90, 0.16);
             border-color: rgba(211, 159, 90, 0.52);
             color: #d39f5a;
             box-shadow: 0 4px 12px rgba(211, 159, 90, 0.16);
         }
+        .nurse-expiry-pill.is-urgent {
+            background: rgba(236, 93, 75, 0.14);
+            border-color: rgba(236, 93, 75, 0.52);
+            color: #ec5d4b;
+            box-shadow: 0 4px 12px rgba(236, 93, 75, 0.14);
+        }
         </style>
         """
     )
 
-    display_df = stock_df.sort_values(["brand_name", "generic_name"]).reset_index(drop=True)
+    sort_columns = ["brand_name", "generic_name"] if sort_by_brand_name else ["generic_name", "brand_name"]
+    display_df = stock_df.sort_values(sort_columns).reset_index(drop=True)
     if display_df.empty:
         st.info("No vaccines are available in the stock list yet.")
         return
@@ -824,13 +845,13 @@ def render_nurse_tab(conn: GSheetsConnection, stock_df: pd.DataFrame) -> None:
                 )
 
                 detail_columns = st.columns(2)
-                detail_columns[0].metric("Stock", stock_level)
+                detail_columns[0].metric("Stock", f"{stock_level}")
                 detail_columns[1].metric(":gray[Order level]", f":gray[{order_level}]")
 
                 if stock_level <= 0:
                     st.error("Out of stock", icon=":material/error:")
                 elif stock_level <= order_level and order_level > 0:
-                    st.warning("Low stock", icon=":material/warning:")
+                    st.warning("Low stock / Reorder", icon=":material/warning:")
                 else:
                     st.info("Ready to record", icon=":material/check_circle:")
 

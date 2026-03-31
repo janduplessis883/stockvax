@@ -3,5 +3,3 @@ streamlit
 pandas
 gspread
 resend
-matplotlib
-seaborn
