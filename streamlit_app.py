@@ -176,7 +176,7 @@ def add_inventory_metrics(stock_df: pd.DataFrame) -> pd.DataFrame:
     df = clean_stock_data(stock_df)
     today = pd.Timestamp.today().normalize()
     df["expiry_dt"] = df["expiry_date"].map(parse_expiry_date)
-    df["days_until_expiry"] = (df["expiry_dt"] - today).dt.days
+    df["days_until_expiry"] = ((df["expiry_dt"] - today).dt.days).astype("Int64")
 
     expected_use = df["expected_monthly_use"].astype(float)
     stock_level = df["stock_level"].astype(float)
