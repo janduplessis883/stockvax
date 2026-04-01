@@ -6,6 +6,8 @@ from pathlib import Path
 import re
 
 import altair as alt
+from gspread import WorksheetNotFound
+from gspread.worksheet import Worksheet
 import numpy as np
 import pandas as pd
 import streamlit as st
@@ -25,6 +27,8 @@ BASE_COLUMNS = [
 TEXT_COLUMNS = ["id", "brand_name", "generic_name", "expiry_date"]
 NUMBER_COLUMNS = ["stock_level", "expected_monthly_use", "order_level"]
 EXPIRY_PATTERN = re.compile(r"^\d{4}$")
+LOG_WORKSHEET_NAME = "log"
+APP_TIMEZONE = "Europe/London"
 
 
 @dataclass
@@ -197,6 +201,89 @@ def add_inventory_metrics(stock_df: pd.DataFrame) -> pd.DataFrame:
 def selected_worksheet_name() -> str | None:
     worksheet_name = st.session_state.get("worksheet_name", "").strip()
     return worksheet_name or None
+
+
+def select_live_worksheet(conn: GSheetsConnection, worksheet_name: str | None) -> Worksheet:
+    return conn.client._select_worksheet(worksheet=worksheet_name)
+
+
+def worksheet_column_index(worksheet: Worksheet, column_name: str) -> int:
+    normalized_headers = [normalize_column_name(value) for value in worksheet.row_values(1)]
+    try:
+        return normalized_headers.index(column_name) + 1
+    except ValueError as exc:
+        raise KeyError(column_name) from exc
+
+
+def worksheet_row_by_cell_value(worksheet: Worksheet, column_index: int, target_value: str) -> int | None:
+    for row_number, value in enumerate(worksheet.col_values(column_index)[1:], start=2):
+        if str(value).strip() == target_value:
+            return row_number
+    return None
+
+
+def append_vaccine_log_row(
+    log_worksheet: Worksheet,
+    *,
+    vaccine_id: str,
+    vaccine_name: str,
+    stock_left_before_click: int,
+) -> None:
+    timestamp = pd.Timestamp.now(tz=APP_TIMEZONE).strftime("%Y-%m-%d %H:%M:%S")
+    log_worksheet.append_row(
+        [
+            vaccine_id,
+            vaccine_name,
+            stock_left_before_click,
+            1,
+            timestamp,
+        ],
+        value_input_option="USER_ENTERED",
+    )
+
+
+def load_vaccine_log_data(conn: GSheetsConnection) -> pd.DataFrame:
+    try:
+        log_df = conn.read(worksheet=LOG_WORKSHEET_NAME, ttl=0, header=None)
+    except WorksheetNotFound:
+        return pd.DataFrame(columns=["vaccine_id", "brand_name", "stock_before", "doses_given", "timestamp"])
+    except Exception:
+        return pd.DataFrame(columns=["vaccine_id", "brand_name", "stock_before", "doses_given", "timestamp"])
+
+    if log_df is None or log_df.empty:
+        return pd.DataFrame(columns=["vaccine_id", "brand_name", "stock_before", "doses_given", "timestamp"])
+
+    trimmed = log_df.iloc[:, :5].copy()
+    while trimmed.shape[1] < 5:
+        trimmed[trimmed.shape[1]] = pd.NA
+
+    trimmed.columns = ["vaccine_id", "brand_name", "stock_before", "doses_given", "timestamp"]
+    trimmed = trimmed.dropna(how="all")
+
+    for column in ["vaccine_id", "brand_name", "timestamp"]:
+        trimmed[column] = trimmed[column].fillna("").astype(str).str.strip()
+
+    trimmed["stock_before"] = pd.to_numeric(trimmed["stock_before"], errors="coerce")
+    trimmed["doses_given"] = pd.to_numeric(trimmed["doses_given"], errors="coerce").fillna(1)
+    trimmed["timestamp"] = pd.to_datetime(trimmed["timestamp"], errors="coerce")
+    trimmed = trimmed[trimmed["timestamp"].notna()].copy()
+
+    return trimmed.reset_index(drop=True)
+
+
+def aggregate_vaccine_log_by_day(log_df: pd.DataFrame) -> pd.DataFrame:
+    if log_df.empty:
+        return pd.DataFrame(columns=["day", "doses_given", "rolling_average"])
+
+    daily_df = (
+        log_df.assign(day=log_df["timestamp"].dt.floor("D"))
+        .groupby("day", as_index=False)["doses_given"]
+        .sum()
+        .sort_values("day")
+        .reset_index(drop=True)
+    )
+    daily_df["rolling_average"] = daily_df["doses_given"].rolling(window=7, min_periods=1).mean()
+    return daily_df
 
 
 def fetch_snapshot(conn: GSheetsConnection, worksheet_name: str | None) -> StockSnapshot:
@@ -580,7 +667,146 @@ def render_stock_usage_plot(stock_df: pd.DataFrame) -> None:
     st.altair_chart(chart, width="stretch")
 
 
-def render_overview(stock_df: pd.DataFrame) -> None:
+def render_vaccine_activity_plot(log_df: pd.DataFrame) -> None:
+    daily_df = aggregate_vaccine_log_by_day(log_df)
+    if daily_df.empty:
+        st.info("No vaccine activity has been logged yet.")
+        return
+
+    primary_color = st.get_option("theme.primaryColor") or "#ec5d4b"
+    accent_color = "#f3a43b"
+    text_color = st.get_option("theme.textColor") or "#0c1722"
+    grid_color = st.get_option("theme.borderColor") or "#d7ded8"
+    tick_color = "#7d8386"
+
+    peak_day = daily_df.loc[daily_df["doses_given"].idxmax()]
+    total_doses = int(daily_df["doses_given"].sum())
+    active_days = int((daily_df["doses_given"] > 0).sum())
+
+    base = alt.Chart(daily_df).encode(
+        x=alt.X(
+            "day:T",
+            title=None,
+            axis=alt.Axis(
+                format="%d %b",
+                labelColor=tick_color,
+                labelFontSize=11,
+                grid=False,
+                domain=False,
+                tickColor=grid_color,
+            ),
+        )
+    )
+
+    area = base.mark_area(
+        line={"color": primary_color, "strokeWidth": 2.6},
+        color=alt.Gradient(
+            gradient="linear",
+            stops=[
+                alt.GradientStop(color=primary_color, offset=0),
+                alt.GradientStop(color="#fff4ef", offset=1),
+            ],
+            x1=1,
+            x2=1,
+            y1=1,
+            y2=0,
+        ),
+        opacity=0.32,
+    ).encode(
+        y=alt.Y(
+            "doses_given:Q",
+            title=None,
+            axis=alt.Axis(
+                labelColor=tick_color,
+                labelFontSize=11,
+                gridColor=grid_color,
+                domain=False,
+                tickColor=grid_color,
+            ),
+        ),
+        tooltip=[
+            alt.Tooltip("day:T", title="Day", format="%d %B %Y"),
+            alt.Tooltip("doses_given:Q", title="Vaccines given", format=".0f"),
+            alt.Tooltip("rolling_average:Q", title="7-day average", format=".1f"),
+        ],
+    )
+
+    pulse_points = base.mark_circle(
+        color=text_color,
+        opacity=0.9,
+        stroke="white",
+        strokeWidth=1.2,
+    ).encode(
+        y="doses_given:Q",
+        size=alt.Size("doses_given:Q", scale=alt.Scale(range=[70, 430]), legend=None),
+    )
+
+    trend_line = base.mark_line(
+        color=accent_color,
+        strokeDash=[8, 6],
+        strokeWidth=2.4,
+    ).encode(
+        y="rolling_average:Q",
+        tooltip=[
+            alt.Tooltip("day:T", title="Day", format="%d %B %Y"),
+            alt.Tooltip("rolling_average:Q", title="7-day average", format=".1f"),
+        ],
+    )
+
+    peak_highlight = (
+        alt.Chart(pd.DataFrame([peak_day]))
+        .mark_point(shape="diamond", filled=True, size=280, color=accent_color, stroke="white", strokeWidth=1.5)
+        .encode(
+            x="day:T",
+            y="doses_given:Q",
+            tooltip=[
+                alt.Tooltip("day:T", title="Peak day", format="%d %B %Y"),
+                alt.Tooltip("doses_given:Q", title="Vaccines given", format=".0f"),
+            ],
+        )
+    )
+
+    peak_label = (
+        alt.Chart(pd.DataFrame([peak_day]))
+        .mark_text(
+            align="left",
+            baseline="bottom",
+            dx=10,
+            dy=-8,
+            color=text_color,
+            fontSize=12,
+            fontWeight="bold",
+        )
+        .encode(
+            x="day:T",
+            y="doses_given:Q",
+            text=alt.value(f"Peak day: {int(peak_day['doses_given'])}"),
+        )
+    )
+
+    chart = (
+        alt.layer(area, trend_line, pulse_points, peak_highlight, peak_label)
+        .properties(
+            title="Daily vaccine activity",
+            height=320,
+        )
+        .configure_title(
+            anchor="start",
+            color=text_color,
+            fontSize=18,
+            fontWeight="bold",
+        )
+        .configure_view(strokeOpacity=0)
+    )
+
+    st.altair_chart(chart, width="stretch")
+    st.caption(
+        f"{total_doses} vaccines logged across {active_days} day(s). "
+        f"Peak activity was {int(peak_day['doses_given'])} on {peak_day['day']:%d %b %Y}."
+    )
+
+
+def render_overview(conn: GSheetsConnection, stock_df: pd.DataFrame) -> None:
     render_metrics(stock_df)
 
     reorder_df = stock_df[stock_df["status"].isin(["Reorder", "Out of stock"])].copy()
@@ -648,6 +874,7 @@ def render_overview(stock_df: pd.DataFrame) -> None:
         st.warning(f"{invalid_expiry_count} expiry value(s) could not be parsed. Use MMYY format, for example 0328.")
 
     render_stock_usage_plot(stock_df)
+    render_vaccine_activity_plot(load_vaccine_log_data(conn))
 
     st.subheader("Current inventory")
     st.dataframe(
@@ -675,6 +902,7 @@ def render_overview(stock_df: pd.DataFrame) -> None:
 def give_vaccine_dose(conn: GSheetsConnection, vaccine_id: str) -> None:
     try:
         latest_df = clean_stock_data(conn.read(worksheet=selected_worksheet_name(), ttl=0))
+        stock_worksheet = select_live_worksheet(conn, selected_worksheet_name())
     except Exception as exc:
         set_flash(
             "error",
@@ -715,11 +943,39 @@ def give_vaccine_dose(conn: GSheetsConnection, vaccine_id: str) -> None:
     latest_df.at[row_index, "stock_level"] = current_stock - 1
 
     try:
-        conn.update(worksheet=selected_worksheet_name(), data=latest_df)
+        id_column_index = worksheet_column_index(stock_worksheet, "id")
+        stock_column_index = worksheet_column_index(stock_worksheet, "stock_level")
+        log_worksheet = select_live_worksheet(conn, LOG_WORKSHEET_NAME)
+        worksheet_row = worksheet_row_by_cell_value(stock_worksheet, id_column_index, vaccine_id)
+
+        if worksheet_row is None:
+            raise KeyError(f"Vaccine ID {vaccine_id} was not found in the live sheet.")
+
+        stock_worksheet.update_cell(worksheet_row, stock_column_index, current_stock - 1)
+        append_vaccine_log_row(
+            log_worksheet,
+            vaccine_id=vaccine_id,
+            vaccine_name=vaccine_name,
+            stock_left_before_click=current_stock,
+        )
+    except WorksheetNotFound:
+        set_flash(
+            "error",
+            f"Could not record the vaccination because the '{LOG_WORKSHEET_NAME}' worksheet was not found.",
+            icon=":material/error:",
+        )
+        st.rerun()
+    except KeyError as exc:
+        set_flash(
+            "error",
+            f"Could not record the vaccination because the live sheet structure did not match the app: {exc}",
+            icon=":material/error:",
+        )
+        st.rerun()
     except Exception as exc:
         set_flash(
             "error",
-            f"Could not save the updated stock for {vaccine_name}: {exc}",
+            f"Could not save the updated stock and log entry for {vaccine_name}: {exc}",
             icon=":material/error:",
         )
         st.rerun()
@@ -1158,7 +1414,7 @@ def render_app() -> None:
         render_delivery_tab(conn, raw_stock)
 
     with overview_tab:
-        render_overview(stock_with_metrics)
+        render_overview(conn, stock_with_metrics)
 
     with editor_tab:
         render_editor(conn, raw_stock)

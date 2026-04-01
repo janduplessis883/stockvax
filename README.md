@@ -63,5 +63,5 @@ Do not commit real secrets to source control.
 ## Notes
 
 - The app reads and writes the whole worksheet when saving updates.
-- Nurse-mode dose recording refreshes from Google Sheets before writing back, so it stays aligned with the latest stock.
+- Nurse-mode dose recording refreshes from Google Sheets, updates only the matching stock cell, and appends a raw log row to the `log` worksheet.
 - A sample CSV is bundled in `data/stockvax_sample.csv` as a local fallback.
