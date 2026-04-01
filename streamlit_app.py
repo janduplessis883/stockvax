@@ -1402,19 +1402,19 @@ def render_app() -> None:
     raw_stock = clean_stock_data(st.session_state.get("stock_data"))
     stock_with_metrics = add_inventory_metrics(raw_stock)
 
-    nurse_tab, delivery_tab, overview_tab, editor_tab = st.tabs(
-        ["Nurse mode", "Record delivery", "Overview", "Stock editor"],
+    nurse_tab, overview_tab, delivery_tab, editor_tab = st.tabs(
+        ["Nurse mode", "Overview", "Record delivery", "Stock editor"],
         default="Nurse mode",
     )
 
     with nurse_tab:
         render_nurse_tab(conn, raw_stock)
 
-    with delivery_tab:
-        render_delivery_tab(conn, raw_stock)
-
     with overview_tab:
         render_overview(conn, stock_with_metrics)
+
+    with delivery_tab:
+        render_delivery_tab(conn, raw_stock)
 
     with editor_tab:
         render_editor(conn, raw_stock)
