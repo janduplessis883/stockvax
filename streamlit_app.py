@@ -470,6 +470,10 @@ def set_flash(kind: str, message: str, icon: str | None = None) -> None:
     st.session_state["flash"] = {"kind": kind, "message": message, "icon": icon}
 
 
+def set_toast(message: str, icon: str | None = None) -> None:
+    st.session_state.setdefault("toast_queue", []).append({"message": message, "icon": icon})
+
+
 def initialize_app_state(conn: GSheetsConnection) -> None:
     if "worksheet_name" not in st.session_state:
         st.session_state["worksheet_name"] = ""
@@ -485,6 +489,14 @@ def show_flash_message() -> None:
     if not flash:
         return
     getattr(st, flash["kind"])(flash["message"], icon=flash.get("icon"))
+
+
+def show_toast_message() -> None:
+    toasts = st.session_state.pop("toast_queue", [])
+    if not toasts:
+        return
+    for toast in toasts:
+        st.toast(toast["message"], icon=toast.get("icon"), duration="long")
 
 
 def frames_match(left: pd.DataFrame, right: pd.DataFrame) -> bool:
@@ -1154,6 +1166,7 @@ def record_inventory_click(
     snapshot_applier: Callable[[StockSnapshot], None],
     item_label_singular: str,
     action_word: str,
+    toast_icon: str,
 ) -> None:
     try:
         latest_df = cleaner(conn.read(worksheet=worksheet_name, ttl=0))
@@ -1242,6 +1255,10 @@ def record_inventory_click(
             message="Live data loaded from Google Sheets.",
         ),
     )
+    set_toast(
+        f"{item_name} - 1 {item_label_singular.lower()} {action_word}",
+        icon=toast_icon,
+    )
     set_flash(
         "success",
         f"{item_name}: 1 {item_label_singular.lower()} {action_word} and recorded successfully.",
@@ -1260,6 +1277,7 @@ def give_vaccine_dose(conn: GSheetsConnection, vaccine_id: str) -> None:
         snapshot_applier=apply_snapshot,
         item_label_singular="Vaccine",
         action_word="given",
+        toast_icon=":material/syringe:",
     )
 
 
@@ -1273,6 +1291,7 @@ def use_consumable(conn: GSheetsConnection, consumable_id: str) -> None:
         snapshot_applier=apply_consumables_snapshot,
         item_label_singular="Consumable",
         action_word="used",
+        toast_icon=":material/clean_hands:",
     )
 
 
@@ -1952,6 +1971,8 @@ def render_app() -> None:
 
     elif active_section == "Stock editor":
         render_editor(conn, raw_stock, raw_consumables)
+
+    show_toast_message()
 
 
 render_app()
