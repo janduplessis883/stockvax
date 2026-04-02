@@ -1327,7 +1327,7 @@ def render_inventory_action_tab(
     with control_columns[0]:
         sort_by_brand_name = st.toggle(
             "Sort by Brand Name",
-            value=False,
+            value=True,
             key=f"{button_key_prefix}_sort",
             help="Off sorts the list by Generic Name.",
         )
