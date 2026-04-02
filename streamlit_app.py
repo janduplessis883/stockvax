@@ -35,7 +35,7 @@ APP_TIMEZONE = "Europe/London"
 VACCINE_STOCK_COLORS = ("#ec5d4b", "#0c1722")
 CONSUMABLE_STOCK_COLORS = ("#d849aa", "#0e1721")
 VACCINE_ACTIVITY_COLORS = ("#ec5d4b", "#f3a43b")
-CONSUMABLE_ACTIVITY_COLORS = ("#16867a", "#6fb7df")
+CONSUMABLE_ACTIVITY_COLORS = ("#c853a6", "#c853a6")
 
 
 @dataclass
@@ -813,7 +813,7 @@ def render_stock_usage_plot(
 
     chart = (
         alt.Chart(long_plot_df)
-        .mark_bar(size=46)
+        .mark_bar(size=28)
         .encode(
             x=alt.X(
                 "brand_name:N",
@@ -1607,7 +1607,7 @@ def render_delivery_section(
     section_title: str,
     input_key_prefix: str,
 ) -> None:
-    st.markdown(f"#### {section_title}")
+    st.markdown(f"## {section_title}")
     if display_df.empty:
         st.info(f"No {section_title.lower()} are available in the stock list yet.")
         return
@@ -1754,7 +1754,7 @@ def render_editor_section(
     save_button_label: str,
     download_file_name: str,
 ) -> None:
-    st.markdown(f"### {section_title}")
+    st.markdown(f"## {section_title}")
     editor_columns = BASE_COLUMNS + [column for column in stock_df.columns if column not in BASE_COLUMNS]
     editable_df = stock_df[editor_columns].copy()
 
@@ -1883,18 +1883,41 @@ def render_app() -> None:
     raw_consumables = clean_consumables_data(st.session_state.get(state_key("consumables", "data")))
     consumables_with_metrics = add_inventory_metrics(raw_consumables, cleaner=clean_consumables_data)
 
-    nurse_tab, consumables_tab, vaccine_overview_tab, consumables_overview_tab, delivery_tab, editor_tab = st.tabs(
-        ["Record VACCINE use", "Record CONSUMABLES use", "Vaccine overview", "Consumables overview", "Record delivery", "Stock editor"],
-        default="Record VACCINE use",
+    navigation_options = [
+        "Record VACCINE use",
+        "Record CONSUMABLES use",
+        "Vaccine overview",
+        "Consumables overview",
+        "Record delivery",
+        "Stock editor",
+    ]
+    if "active_section" not in st.session_state:
+        st.session_state["active_section"] = navigation_options[0]
+
+    active_section = st.radio(
+        "Section",
+        options=navigation_options,
+        key="active_section",
+        horizontal=True,
+        label_visibility="collapsed",
+    )
+    st.html(
+        """
+        <style>
+        div[role="radiogroup"] label p {
+            font-weight: 800;
+        }
+        </style>
+        """
     )
 
-    with nurse_tab:
+    if active_section == "Record VACCINE use":
         render_nurse_tab(conn, raw_stock)
 
-    with consumables_tab:
+    elif active_section == "Record CONSUMABLES use":
         render_consumables_tab(conn, raw_consumables)
 
-    with vaccine_overview_tab:
+    elif active_section == "Vaccine overview":
         render_inventory_overview(
             conn,
             stock_with_metrics,
@@ -1909,7 +1932,7 @@ def render_app() -> None:
             activity_chart_colors=VACCINE_ACTIVITY_COLORS,
         )
 
-    with consumables_overview_tab:
+    elif active_section == "Consumables overview":
         render_inventory_overview(
             conn,
             consumables_with_metrics,
@@ -1924,10 +1947,10 @@ def render_app() -> None:
             activity_chart_colors=CONSUMABLE_ACTIVITY_COLORS,
         )
 
-    with delivery_tab:
+    elif active_section == "Record delivery":
         render_delivery_tab(conn, raw_stock, raw_consumables)
 
-    with editor_tab:
+    elif active_section == "Stock editor":
         render_editor(conn, raw_stock, raw_consumables)
 
 
