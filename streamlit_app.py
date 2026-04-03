@@ -39,7 +39,7 @@ VACCINE_CATEGORY_COLUMN = "category"
 VACCINE_CATEGORY = "vaccine"
 EMERGENCY_DRUG_CATEGORY = "emergency_drug"
 VACCINE_STOCK_COLORS = ("#ec5d4b", "#0c1722")
-CONSUMABLE_STOCK_COLORS = ("#d849aa", "#0e1721")
+CONSUMABLE_STOCK_COLORS = ("#74a8d1", "#0e1721")
 VACCINE_ACTIVITY_COLORS = ("#ec5d4b", "#f3a43b")
 CONSUMABLE_ACTIVITY_COLORS = ("#c853a6", "#c853a6")
 
@@ -1312,24 +1312,24 @@ def render_metrics(
 
 def watchlist_row_styles(row: pd.Series, table_kind: str) -> list[str]:
     text_color = st.get_option("theme.textColor") or "#0c1722"
-    primary_color = st.get_option("theme.primaryColor") or "#ec5d4b"
-    red_color = st.get_option("theme.redColor") or primary_color
-    reorder_color = "#f4f6f2"
-    expiry_soon_color = "#e4af6c"
+    reorder_color = "#f6e568"
+    out_of_stock_color = "#cb3f4e"
+    expiry_soon_color = "#a9b0a6"
+    expired_stock_color = "#5f676f"
 
     background = ""
     border = ""
     status = row.get("status", "")
 
     if status == "Out of stock":
-        background = hex_to_rgba(red_color, 0.14)
-        border = f"4px solid {red_color}"
+        background = hex_to_rgba(out_of_stock_color, 0.26)
+        border = f"4px solid {out_of_stock_color}"
     elif status == "Expired stock":
-        background = hex_to_rgba(red_color, 0.12)
-        border = f"4px solid {red_color}"
+        background = hex_to_rgba(expired_stock_color, 0.22)
+        border = f"4px solid {expired_stock_color}"
     elif status == "Reorder":
         background = reorder_color
-        border = f"4px solid {primary_color}"
+        border = f"4px solid {reorder_color}"
     elif status == "Expiring soon":
         background = hex_to_rgba(expiry_soon_color, 0.22)
         border = f"4px solid {expiry_soon_color}"
@@ -1374,6 +1374,7 @@ def render_stock_usage_plot(
     empty_message: str,
     item_label: str,
     value_label: str,
+    bar_size: int = 22,
 ) -> None:
     plot_df = (
         stock_df[["brand_name", "stock_level", "expected_monthly_use"]]
@@ -1408,7 +1409,7 @@ def render_stock_usage_plot(
 
     chart = (
         alt.Chart(long_plot_df)
-        .mark_bar(size=28)
+        .mark_bar(size=bar_size)
         .encode(
             x=alt.X(
                 "brand_name:N",
@@ -1619,6 +1620,37 @@ def render_inventory_activity_plot(
     )
 
 
+def render_split_vaccine_stock_usage_plots(
+    stock_df: pd.DataFrame,
+    *,
+    series_colors: tuple[str, str],
+    value_label: str,
+) -> None:
+    category_series = stock_df.apply(resolve_stock_category, axis=1)
+    vaccine_df = stock_df[category_series != EMERGENCY_DRUG_CATEGORY].reset_index(drop=True)
+    emergency_df = stock_df[category_series == EMERGENCY_DRUG_CATEGORY].reset_index(drop=True)
+    emergency_series_colors = ("#d849ab", series_colors[1])
+
+    render_stock_usage_plot(
+        vaccine_df,
+        title="Vaccines: current stock vs expected monthly use",
+        series_colors=series_colors,
+        empty_message="No vaccine data is available to plot yet.",
+        item_label="Vaccine",
+        value_label=value_label,
+        bar_size=33,
+    )
+    render_stock_usage_plot(
+        emergency_df,
+        title="Emergency drugs: current stock vs expected monthly use",
+        series_colors=emergency_series_colors,
+        empty_message="No emergency drug data is available to plot yet.",
+        item_label="Emergency drug",
+        value_label=value_label,
+        bar_size=33,
+    )
+
+
 def render_inventory_overview(
     stock_df: pd.DataFrame,
     log_df: pd.DataFrame,
@@ -1632,6 +1664,7 @@ def render_inventory_overview(
     log_worksheet_name: str,
     stock_chart_colors: tuple[str, str],
     activity_chart_colors: tuple[str, str],
+    split_vaccine_categories: bool = False,
 ) -> None:
     render_metrics(stock_df, log_df, tracked_label=tracked_label, on_hand_label=on_hand_label)
 
@@ -1699,14 +1732,21 @@ def render_inventory_overview(
     if invalid_expiry_count:
         st.warning(f"{invalid_expiry_count} expiry value(s) could not be parsed. Use MMYY format, for example 0328.")
 
-    render_stock_usage_plot(
-        stock_df,
-        title=f"{section_title}: current stock vs expected monthly use",
-        series_colors=stock_chart_colors,
-        empty_message=f"No {item_label_plural.lower()} data is available to plot yet.",
-        item_label=section_title,
-        value_label=value_label,
-    )
+    if split_vaccine_categories:
+        render_split_vaccine_stock_usage_plots(
+            stock_df,
+            series_colors=stock_chart_colors,
+            value_label=value_label,
+        )
+    else:
+        render_stock_usage_plot(
+            stock_df,
+            title=f"{section_title}: current stock vs expected monthly use",
+            series_colors=stock_chart_colors,
+            empty_message=f"No {item_label_plural.lower()} data is available to plot yet.",
+            item_label=section_title,
+            value_label=value_label,
+        )
     render_inventory_activity_plot(
         log_df,
         title=f"Daily {item_label_plural.lower()} activity",
@@ -1900,14 +1940,22 @@ def render_inventory_action_tab(
     split_vaccine_categories: bool = False,
 ) -> None:
     with st.expander(expander_title, icon=":material/bar_chart:"):
-        render_stock_usage_plot(
-            add_inventory_metrics(stock_df, cleaner=cleaner),
-            title="Current stock vs expected monthly use",
-            series_colors=chart_colors,
-            empty_message=empty_message,
-            item_label=chart_item_label,
-            value_label="Units",
-        )
+        stock_with_metrics = add_inventory_metrics(stock_df, cleaner=cleaner)
+        if split_vaccine_categories:
+            render_split_vaccine_stock_usage_plots(
+                stock_with_metrics,
+                series_colors=chart_colors,
+                value_label="Units",
+            )
+        else:
+            render_stock_usage_plot(
+                stock_with_metrics,
+                title="Current stock vs expected monthly use",
+                series_colors=chart_colors,
+                empty_message=empty_message,
+                item_label=chart_item_label,
+                value_label="Units",
+            )
     control_columns = st.columns([1, 1.35])
     with control_columns[0]:
         sort_by_brand_name = st.toggle(
@@ -2325,9 +2373,19 @@ def render_delivery_tab(conn: GSheetsConnection, vaccine_df: pd.DataFrame, consu
     st.subheader("Record delivery")
     st.caption("Enter any new stock delivered today for vaccines or consumables, then save once to add the quantities onto the live stock levels.")
 
-    vaccine_display_df = vaccine_df.sort_values(["brand_name", "generic_name"]).reset_index(drop=True)
+    vaccine_category_series = vaccine_df.apply(resolve_stock_category, axis=1)
+    vaccine_display_df = (
+        vaccine_df[vaccine_category_series != EMERGENCY_DRUG_CATEGORY]
+        .sort_values(["brand_name", "generic_name"])
+        .reset_index(drop=True)
+    )
+    emergency_display_df = (
+        vaccine_df[vaccine_category_series == EMERGENCY_DRUG_CATEGORY]
+        .sort_values(["brand_name", "generic_name"])
+        .reset_index(drop=True)
+    )
     consumables_display_df = consumables_df.sort_values(["brand_name", "generic_name"]).reset_index(drop=True)
-    if vaccine_display_df.empty and consumables_display_df.empty:
+    if vaccine_display_df.empty and emergency_display_df.empty and consumables_display_df.empty:
         st.info("No vaccines or consumables are available in the stock list yet.")
         return
 
@@ -2388,6 +2446,13 @@ def render_delivery_tab(conn: GSheetsConnection, vaccine_df: pd.DataFrame, consu
             input_key_prefix="delivery_vaccine",
         )
         st.divider()
+        emergency_qr_request = render_delivery_section(
+            emergency_display_df,
+            section_title="Emergency drugs",
+            input_key_prefix="delivery_emergency",
+        )
+        qr_request = emergency_qr_request or qr_request
+        st.divider()
         consumables_qr_request = render_delivery_section(
             consumables_display_df,
             section_title="Consumables",
@@ -2412,11 +2477,15 @@ def render_delivery_tab(conn: GSheetsConnection, vaccine_df: pd.DataFrame, consu
             row["id"]: int(st.session_state.get(f"delivery_vaccine_{row['id']}", 0))
             for _, row in vaccine_display_df.iterrows()
         }
+        emergency_deliveries = {
+            row["id"]: int(st.session_state.get(f"delivery_emergency_{row['id']}", 0))
+            for _, row in emergency_display_df.iterrows()
+        }
         consumable_deliveries = {
             row["id"]: int(st.session_state.get(f"delivery_consumable_{row['id']}", 0))
             for _, row in consumables_display_df.iterrows()
         }
-        record_delivery(conn, vaccine_deliveries, consumable_deliveries)
+        record_delivery(conn, {**vaccine_deliveries, **emergency_deliveries}, consumable_deliveries)
 
     st.divider()
     batch_vaccine_column, batch_consumable_column = st.columns(2)
@@ -2464,10 +2533,14 @@ def render_editor_section(
     generic_column_name: str,
     save_button_label: str,
     download_file_name: str,
+    full_stock_df: pd.DataFrame | None = None,
+    default_category: str | None = None,
 ) -> None:
     st.markdown(f"## {section_title}")
     editor_columns = BASE_COLUMNS + [column for column in stock_df.columns if column not in BASE_COLUMNS]
     editable_df = stock_df[editor_columns].copy()
+    if default_category and VACCINE_CATEGORY_COLUMN in editable_df.columns:
+        editable_df[VACCINE_CATEGORY_COLUMN] = editable_df[VACCINE_CATEGORY_COLUMN].replace("", pd.NA).fillna(default_category)
 
     edited_df = st.data_editor(
         editable_df,
@@ -2497,7 +2570,13 @@ def render_editor_section(
         },
     )
 
-    cleaned_edited_df = cleaner(edited_df)
+    editor_output_df = edited_df.copy()
+    if default_category and VACCINE_CATEGORY_COLUMN in editor_output_df.columns:
+        editor_output_df[VACCINE_CATEGORY_COLUMN] = (
+            editor_output_df[VACCINE_CATEGORY_COLUMN].replace("", pd.NA).fillna(default_category)
+        )
+
+    cleaned_edited_df = cleaner(editor_output_df)
     changes_pending = not frames_match(cleaned_edited_df, cleaner(stock_df))
 
     if changes_pending:
@@ -2517,13 +2596,17 @@ def render_editor_section(
 
     if save_clicked:
         try:
+            data_to_save = cleaned_edited_df
+            if full_stock_df is not None:
+                untouched_df = full_stock_df[~full_stock_df["id"].isin(stock_df["id"])].copy()
+                data_to_save = cleaner(pd.concat([untouched_df, cleaned_edited_df], ignore_index=True))
             conn.update(
                 worksheet=worksheet_name,
-                data=prepare_inventory_sheet_data(cleaned_edited_df, generic_column_name=generic_column_name),
+                data=prepare_inventory_sheet_data(data_to_save, generic_column_name=generic_column_name),
             )
             snapshot_applier(
                 StockSnapshot(
-                    data=cleaned_edited_df,
+                    data=data_to_save,
                     source_kind="google",
                     message="Changes saved to Google Sheets.",
                 ),
@@ -2556,9 +2639,16 @@ def render_editor(conn: GSheetsConnection, vaccine_df: pd.DataFrame, consumables
     st.write("Edit the tables below, add rows at the bottom if needed, then save each table back to Google Sheets.")
     st.caption("IDs are generated automatically when blank. Use expiry format MMYY, for example 0328.")
 
+    vaccine_only_df = vaccine_df[
+        vaccine_df[VACCINE_CATEGORY_COLUMN].fillna(VACCINE_CATEGORY) == VACCINE_CATEGORY
+    ].reset_index(drop=True)
+    emergency_drug_df = vaccine_df[
+        vaccine_df[VACCINE_CATEGORY_COLUMN].fillna(VACCINE_CATEGORY) == EMERGENCY_DRUG_CATEGORY
+    ].reset_index(drop=True)
+
     render_editor_section(
         conn,
-        vaccine_df,
+        vaccine_only_df,
         section_title="Vaccines",
         worksheet_name=selected_worksheet_name(),
         cleaner=clean_stock_data,
@@ -2568,6 +2658,24 @@ def render_editor(conn: GSheetsConnection, vaccine_df: pd.DataFrame, consumables
         generic_column_name="generic_name",
         save_button_label="Save vaccines to Google Sheet",
         download_file_name="stockvax_vaccines_snapshot.csv",
+        full_stock_df=vaccine_df,
+        default_category=VACCINE_CATEGORY,
+    )
+    st.divider()
+    render_editor_section(
+        conn,
+        emergency_drug_df,
+        section_title="Emergency drugs",
+        worksheet_name=selected_worksheet_name(),
+        cleaner=clean_stock_data,
+        snapshot_applier=apply_snapshot,
+        editor_key="emergency_stock_editor",
+        generic_name_label="Generic name",
+        generic_column_name="generic_name",
+        save_button_label="Save emergency drugs to Google Sheet",
+        download_file_name="stockvax_emergency_drugs_snapshot.csv",
+        full_stock_df=vaccine_df,
+        default_category=EMERGENCY_DRUG_CATEGORY,
     )
     st.divider()
     render_editor_section(
@@ -2910,6 +3018,7 @@ def render_app() -> None:
             log_worksheet_name=LOG_WORKSHEET_NAME,
             stock_chart_colors=VACCINE_STOCK_COLORS,
             activity_chart_colors=VACCINE_ACTIVITY_COLORS,
+            split_vaccine_categories=True,
         )
 
     elif active_section == "Consumables overview":
