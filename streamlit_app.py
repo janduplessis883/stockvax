@@ -2637,26 +2637,7 @@ def render_consume_mode(conn: GSheetsConnection) -> None:
     render_mobile_inventory_shell_close()
 
 
-@st.dialog("Item QR Code")
-def show_item_qr_dialog(item_id: str, item_name: str, section_title: str, mode: str) -> None:
-    qr_url = qr_image_url_for_item(item_id, mode)
-    target_url = app_url_for_item(item_id, mode)
-    mode_label = "RESTOCK" if mode == "restock" else "CONSUME / USE"
-    st.badge(f"{section_title}: {item_id}", color="blue")
-    st.markdown(f"### {item_name}")
-    st.badge(mode_label, color="orange", width="stretch")
-    st.image(qr_url, width=320)
-    st.caption(f"Scan this code to open the mobile {mode_label.lower()} page for this item.")
-    st.code(target_url, language=None)
-
-
-def render_batch_qr_sheet(display_df: pd.DataFrame, section_title: str) -> None:
-    st.subheader(f"{section_title} QR sheet")
-    st.caption("Print or capture this sheet from the page below. Each item has a restock QR on the left and a consume QR on the right.")
-    if display_df.empty:
-        st.info(f"No {section_title.lower()} are available for QR printing yet.")
-        return
-
+def render_qr_print_styles() -> None:
     st.html(
         """
         <style>
@@ -2719,45 +2700,70 @@ def render_batch_qr_sheet(display_df: pd.DataFrame, section_title: str) -> None:
         """
     )
 
+
+def render_qr_print_block(item_id: str, item_name: str, item_description: str, mode: str) -> None:
+    target_url = app_url_for_item(item_id, mode)
+    mode_label = "RESTOCK" if mode == "restock" else "CONSUME STOCK"
+    st.markdown(
+        f"""
+        <div class="qr-print-block">
+            <div class="qr-print-title">
+                <span>{html.escape(item_name)}</span>
+                <a class="qr-print-link" href="{html.escape(target_url)}" target="_blank" rel="noopener noreferrer">↪</a>
+            </div>
+            <div class="qr-print-generic">{html.escape(item_description)}</div>
+            <div class="qr-print-id">{html.escape(item_id)}</div>
+            <img class="qr-print-image" src="{html.escape(qr_image_url_for_item(item_id, mode))}" alt="{html.escape(mode_label)} QR for {html.escape(item_name)}" />
+            <div class="qr-print-pill">{html.escape(mode_label)}</div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+@st.dialog("Item QR Code")
+def show_item_qr_dialog(item_id: str, item_name: str, section_title: str, mode: str) -> None:
+    target_url = app_url_for_item(item_id, mode)
+    item_description = "Generic name / description"
+    inventory_frames = [
+        clean_stock_data(st.session_state.get(state_key("vaccine", "data"))),
+        clean_consumables_data(st.session_state.get(state_key("consumables", "data"))),
+    ]
+    for frame in inventory_frames:
+        if frame.empty:
+            continue
+        match = frame["id"].astype(str).str.strip().str.upper() == item_id.strip().upper()
+        if match.any():
+            row = frame.loc[match].iloc[0]
+            item_description = row.get("generic_name") or row.get("generic_name_description") or item_description
+            item_name = row.get("brand_name") or row.get("generic_name") or row.get("generic_name_description") or item_name
+            break
+
+    st.badge(f"{section_title}: {item_id}", color="blue")
+    render_qr_print_styles()
+    render_qr_print_block(item_id, item_name, item_description, mode)
+    st.caption(f"Scan this code to open the mobile {('restock' if mode == 'restock' else 'consume stock')} page for this item.")
+    st.code(target_url, language=None)
+
+
+def render_batch_qr_sheet(display_df: pd.DataFrame, section_title: str) -> None:
+    st.subheader(f"{section_title} QR sheet")
+    st.caption("Print or capture this sheet from the page below. Each item has a restock QR on the left and a consume QR on the right.")
+    if display_df.empty:
+        st.info(f"No {section_title.lower()} are available for QR printing yet.")
+        return
+
+    render_qr_print_styles()
+
     for _, row in display_df.iterrows():
         item_id = str(row["id"]).strip().upper()
         item_name = row["brand_name"] or row["generic_name"] or item_id
         item_description = row["generic_name"] or "Generic name / description"
         restock_column, consume_column = st.columns(2)
         with restock_column:
-            restock_url = app_url_for_item(item_id, "restock")
-            st.markdown(
-                f"""
-                <div class="qr-print-block">
-                    <div class="qr-print-title">
-                        <span>{html.escape(item_name)}</span>
-                        <a class="qr-print-link" href="{html.escape(restock_url)}" target="_blank" rel="noopener noreferrer">↪</a>
-                    </div>
-                    <div class="qr-print-generic">{html.escape(item_description)}</div>
-                    <div class="qr-print-id">{html.escape(item_id)}</div>
-                    <img class="qr-print-image" src="{html.escape(qr_image_url_for_item(item_id, 'restock'))}" alt="Restock QR for {html.escape(item_name)}" />
-                    <div class="qr-print-pill">RESTOCK</div>
-                </div>
-                """,
-                unsafe_allow_html=True,
-            )
+            render_qr_print_block(item_id, item_name, item_description, "restock")
         with consume_column:
-            consume_url = app_url_for_item(item_id, "consume")
-            st.markdown(
-                f"""
-                <div class="qr-print-block">
-                    <div class="qr-print-title">
-                        <span>{html.escape(item_name)}</span>
-                        <a class="qr-print-link" href="{html.escape(consume_url)}" target="_blank" rel="noopener noreferrer">↪</a>
-                    </div>
-                    <div class="qr-print-generic">{html.escape(item_description)}</div>
-                    <div class="qr-print-id">{html.escape(item_id)}</div>
-                    <img class="qr-print-image" src="{html.escape(qr_image_url_for_item(item_id, 'consume'))}" alt="Consume QR for {html.escape(item_name)}" />
-                    <div class="qr-print-pill">CONSUME STOCK</div>
-                </div>
-                """,
-                unsafe_allow_html=True,
-            )
+            render_qr_print_block(item_id, item_name, item_description, "consume")
         st.divider()
 
 
