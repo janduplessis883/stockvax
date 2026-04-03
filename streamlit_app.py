@@ -2657,19 +2657,107 @@ def render_batch_qr_sheet(display_df: pd.DataFrame, section_title: str) -> None:
         st.info(f"No {section_title.lower()} are available for QR printing yet.")
         return
 
+    st.html(
+        """
+        <style>
+        .qr-print-block {
+            padding: 0.2rem 0.35rem 0.7rem;
+        }
+        .qr-print-title {
+            display: flex;
+            align-items: center;
+            gap: 0.4rem;
+            margin: 0;
+            color: #0c1722;
+            font-size: 1.05rem;
+            font-weight: 850;
+            line-height: 1.08;
+            letter-spacing: -0.02em;
+        }
+        .qr-print-link {
+            color: #7d8386;
+            font-size: 0.9rem;
+            text-decoration: none;
+        }
+        .qr-print-generic {
+            margin: 0.18rem 0 0;
+            color: #cf4c34;
+            font-size: 0.84rem;
+            font-weight: 650;
+            line-height: 1.15;
+        }
+        .qr-print-id {
+            margin: 0.15rem 0 0.55rem;
+            color: #7d8386;
+            font-size: 0.78rem;
+            font-weight: 700;
+            letter-spacing: 0.01em;
+        }
+        .qr-print-image {
+            width: 9.5rem;
+            max-width: 100%;
+            display: block;
+            margin: 0.05rem 0 0.7rem;
+        }
+        .qr-print-pill {
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            min-height: 2.25rem;
+            padding: 0.3rem 1.15rem;
+            border-radius: 999px;
+            background: rgba(219, 102, 83, 0.1);
+            border: 1px solid rgba(219, 102, 83, 0.12);
+            color: #cf5b3b;
+            font-size: 0.92rem;
+            font-weight: 850;
+            letter-spacing: 0.015em;
+            text-transform: uppercase;
+            white-space: nowrap;
+        }
+        </style>
+        """
+    )
+
     for _, row in display_df.iterrows():
         item_id = str(row["id"]).strip().upper()
         item_name = row["brand_name"] or row["generic_name"] or item_id
-        st.markdown(f"### {item_name}")
+        item_description = row["generic_name"] or "Generic name / description"
         restock_column, consume_column = st.columns(2)
         with restock_column:
-            st.caption("RESTOCK")
-            st.image(qr_image_url_for_item(item_id, "restock"), width=150)
-            st.caption(item_id)
+            restock_url = app_url_for_item(item_id, "restock")
+            st.markdown(
+                f"""
+                <div class="qr-print-block">
+                    <div class="qr-print-title">
+                        <span>{html.escape(item_name)}</span>
+                        <a class="qr-print-link" href="{html.escape(restock_url)}" target="_blank" rel="noopener noreferrer">↪</a>
+                    </div>
+                    <div class="qr-print-generic">{html.escape(item_description)}</div>
+                    <div class="qr-print-id">{html.escape(item_id)}</div>
+                    <img class="qr-print-image" src="{html.escape(qr_image_url_for_item(item_id, 'restock'))}" alt="Restock QR for {html.escape(item_name)}" />
+                    <div class="qr-print-pill">RESTOCK</div>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
         with consume_column:
-            st.caption("CONSUME / USE")
-            st.image(qr_image_url_for_item(item_id, "consume"), width=150)
-            st.caption(item_id)
+            consume_url = app_url_for_item(item_id, "consume")
+            st.markdown(
+                f"""
+                <div class="qr-print-block">
+                    <div class="qr-print-title">
+                        <span>{html.escape(item_name)}</span>
+                        <a class="qr-print-link" href="{html.escape(consume_url)}" target="_blank" rel="noopener noreferrer">↪</a>
+                    </div>
+                    <div class="qr-print-generic">{html.escape(item_description)}</div>
+                    <div class="qr-print-id">{html.escape(item_id)}</div>
+                    <img class="qr-print-image" src="{html.escape(qr_image_url_for_item(item_id, 'consume'))}" alt="Consume QR for {html.escape(item_name)}" />
+                    <div class="qr-print-pill">CONSUME STOCK</div>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
         st.divider()
 
 
