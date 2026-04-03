@@ -334,6 +334,68 @@ def selected_worksheet_name() -> str | None:
     return worksheet_name or None
 
 
+def query_param_value(*names: str) -> str:
+    for name in names:
+        value = st.query_params.get(name)
+        if isinstance(value, list):
+            value = value[0] if value else ""
+        if value:
+            return str(value).strip()
+    return ""
+
+
+def is_restock_mode() -> bool:
+    return query_param_value("mode").casefold() == "restock"
+
+
+def inventory_config_for_item_id(
+    item_id: str,
+) -> tuple[str | None, Callable[[pd.DataFrame | None], pd.DataFrame], str, str]:
+    normalized_id = item_id.strip().upper()
+    if normalized_id.startswith("CON-"):
+        return (
+            CONSUMABLES_WORKSHEET_NAME,
+            clean_consumables_data,
+            "generic_name_description",
+            "Consumable",
+        )
+    return (
+        selected_worksheet_name(),
+        clean_stock_data,
+        "generic_name",
+        "Emergency drug" if normalized_id.startswith("EMER-") else "Vaccine",
+    )
+
+
+def fetch_inventory_item(
+    conn: GSheetsConnection,
+    item_id: str,
+) -> tuple[pd.DataFrame, pd.Series, str | None, Callable[[pd.DataFrame | None], pd.DataFrame], str, str]:
+    worksheet_name, cleaner, generic_column_name, item_label = inventory_config_for_item_id(item_id)
+    latest_df = cleaner(conn.read(worksheet=worksheet_name, ttl=0))
+    if latest_df.empty:
+        raise ValueError(f"The {item_label.lower()} sheet is empty.")
+
+    match = latest_df["id"].astype(str).str.strip().str.upper() == item_id.strip().upper()
+    if not match.any():
+        raise KeyError(item_id)
+
+    row_index = latest_df.index[match][0]
+    return latest_df, latest_df.loc[row_index], worksheet_name, cleaner, generic_column_name, item_label
+
+
+def restock_inventory_item(conn: GSheetsConnection, item_id: str, amount: int) -> tuple[str, int]:
+    latest_df, row, worksheet_name, _, generic_column_name, item_label = fetch_inventory_item(conn, item_id)
+    row_index = row.name
+    current_stock = int(latest_df.at[row_index, "stock_level"])
+    latest_df.at[row_index, "stock_level"] = current_stock + int(amount)
+    conn.update(
+        worksheet=worksheet_name,
+        data=prepare_inventory_sheet_data(latest_df, generic_column_name=generic_column_name),
+    )
+    return item_label, int(latest_df.at[row_index, "stock_level"])
+
+
 def select_live_worksheet(conn: GSheetsConnection, worksheet_name: str | None) -> Worksheet:
     return conn.client._select_worksheet(worksheet=worksheet_name)
 
@@ -2264,10 +2326,116 @@ def render_editor(conn: GSheetsConnection, vaccine_df: pd.DataFrame, consumables
     )
 
 
+def render_restock_mode(conn: GSheetsConnection) -> None:
+    item_id = query_param_value("item_id", "item-id").upper()
+
+    st.html(
+        """
+        <style>
+        .restock-shell {
+            max-width: 32rem;
+            margin: 0 auto;
+            padding: 0.5rem 0 1.5rem;
+        }
+        .restock-card {
+            background: #ffffff;
+            border: 1px solid rgba(12, 23, 34, 0.08);
+            border-radius: 24px;
+            padding: 1.15rem 1rem 1rem;
+            box-shadow: 0 18px 40px rgba(12, 23, 34, 0.08);
+        }
+        .restock-eyebrow {
+            color: #db6653;
+            font-size: 0.82rem;
+            font-weight: 800;
+            letter-spacing: 0.08em;
+            text-transform: uppercase;
+            margin-bottom: 0.35rem;
+        }
+        .restock-title {
+            color: #0c1722;
+            font-size: 2rem;
+            font-weight: 900;
+            line-height: 1.02;
+            letter-spacing: -0.04em;
+            margin: 0;
+        }
+        .restock-subtitle {
+            color: #6b7280;
+            font-size: 1rem;
+            font-weight: 600;
+            line-height: 1.2;
+            margin: 0.35rem 0 1rem;
+        }
+        </style>
+        <div class="restock-shell">
+            <div class="restock-card">
+                <div class="restock-eyebrow">QR Restock</div>
+        """
+    )
+
+    if not item_id:
+        st.error("No item ID was provided in the QR link.")
+        st.html("</div></div>")
+        return
+
+    try:
+        latest_df, row, _, _, _, item_label = fetch_inventory_item(conn, item_id)
+    except KeyError:
+        st.error(f"Item `{item_id}` was not found.")
+        st.html("</div></div>")
+        return
+    except Exception as exc:
+        st.error(f"Could not load `{item_id}` from Google Sheets: {exc}")
+        st.html("</div></div>")
+        return
+
+    item_name = row["brand_name"] or row["generic_name"] or item_id
+    item_description = row["generic_name"] or item_label
+    current_stock = int(row["stock_level"])
+    expiry_display = format_expiry_display(row["expiry_date"])
+
+    st.markdown(f"<div class='restock-title'>{html.escape(item_name)}</div>", unsafe_allow_html=True)
+    st.markdown(f"<div class='restock-subtitle'>{html.escape(item_description)}</div>", unsafe_allow_html=True)
+
+    badge_columns = st.columns(2)
+    badge_columns[0].badge(f"ID: {item_id}", color="blue", width="stretch")
+    badge_columns[1].badge(
+        f"Current stock: {current_stock}",
+        color="green" if current_stock > 0 else "red",
+        width="stretch",
+    )
+    if expiry_display:
+        is_expired = pd.notna(parse_expiry_date(row["expiry_date"])) and parse_expiry_date(row["expiry_date"]) < pd.Timestamp.today().normalize()
+        st.badge(
+            f"Expiry: {expiry_display}",
+            color="red" if is_expired else "gray",
+            width="stretch",
+        )
+
+    with st.form("qr_restock_form", clear_on_submit=True, width="stretch"):
+        amount = st.number_input("Amount re-stocked", min_value=1, step=1, value=1, width="stretch")
+        submitted = st.form_submit_button("Update stock", type="primary", width="stretch")
+
+    if submitted:
+        try:
+            item_label, new_stock = restock_inventory_item(conn, item_id, int(amount))
+            st.success(f"{item_label} updated successfully. New stock level: {new_stock}.")
+        except Exception as exc:
+            st.error(f"Could not update `{item_id}`: {exc}")
+
+    st.html("</div></div>")
+
+
 def render_app() -> None:
+    conn = st.connection("gsheets", type=GSheetsConnection)
+
+    if is_restock_mode():
+        render_restock_mode(conn)
+        return
+
     render_title_banner()
 
-    conn = st.connection("gsheets", type=GSheetsConnection)
     initialize_app_state(conn)
     render_sidebar(conn)
     show_flash_message()
