@@ -2363,9 +2363,19 @@ def render_delivery_tab(conn: GSheetsConnection, vaccine_df: pd.DataFrame, consu
         )
 
     if vaccine_batch_clicked:
-        show_batch_qr_dialog(vaccine_display_df, "Vaccines / Emergency Rx")
+        current_sheet = st.session_state.get("delivery_qr_sheet")
+        st.session_state["delivery_qr_sheet"] = None if current_sheet == "vaccines" else "vaccines"
     if consumable_batch_clicked:
-        show_batch_qr_dialog(consumables_display_df, "Consumables")
+        current_sheet = st.session_state.get("delivery_qr_sheet")
+        st.session_state["delivery_qr_sheet"] = None if current_sheet == "consumables" else "consumables"
+
+    selected_sheet = st.session_state.get("delivery_qr_sheet")
+    if selected_sheet == "vaccines":
+        st.divider()
+        render_batch_qr_sheet(vaccine_display_df, "Vaccines / Emergency Rx")
+    elif selected_sheet == "consumables":
+        st.divider()
+        render_batch_qr_sheet(consumables_display_df, "Consumables")
 
 
 def render_editor_section(
@@ -2640,9 +2650,9 @@ def show_item_qr_dialog(item_id: str, item_name: str, section_title: str, mode: 
     st.code(target_url, language=None)
 
 
-@st.dialog("Printable QR Codes")
-def show_batch_qr_dialog(display_df: pd.DataFrame, section_title: str) -> None:
-    st.caption("Print or capture this sheet. Each item has a restock QR on the left and a consume QR on the right.")
+def render_batch_qr_sheet(display_df: pd.DataFrame, section_title: str) -> None:
+    st.subheader(f"{section_title} QR sheet")
+    st.caption("Print or capture this sheet from the page below. Each item has a restock QR on the left and a consume QR on the right.")
     if display_df.empty:
         st.info(f"No {section_title.lower()} are available for QR printing yet.")
         return
