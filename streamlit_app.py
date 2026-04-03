@@ -32,6 +32,9 @@ LOG_WORKSHEET_NAME = "log"
 CONSUMABLES_WORKSHEET_NAME = "consumables"
 CONSUMABLES_LOG_WORKSHEET_NAME = "consumables_log"
 APP_TIMEZONE = "Europe/London"
+VACCINE_CATEGORY_COLUMN = "category"
+VACCINE_CATEGORY = "vaccine"
+EMERGENCY_DRUG_CATEGORY = "emergency_drug"
 VACCINE_STOCK_COLORS = ("#ec5d4b", "#0c1722")
 CONSUMABLE_STOCK_COLORS = ("#d849aa", "#0e1721")
 VACCINE_ACTIVITY_COLORS = ("#ec5d4b", "#f3a43b")
@@ -112,7 +115,58 @@ def make_unique_ids(values: pd.Series, blank_id_template: str) -> pd.Series:
     return pd.Series(generated, index=values.index)
 
 
-def clean_inventory_data(raw_df: pd.DataFrame | None, *, blank_id_template: str) -> pd.DataFrame:
+def normalize_stock_category(value: object) -> str:
+    normalized = normalize_column_name(value)
+    return EMERGENCY_DRUG_CATEGORY if normalized == EMERGENCY_DRUG_CATEGORY else VACCINE_CATEGORY
+
+
+def resolve_stock_category(row: pd.Series) -> str:
+    candidate = normalize_stock_category(row.get(VACCINE_CATEGORY_COLUMN, VACCINE_CATEGORY))
+    item_id = str(row.get("id", "")).strip().upper()
+    if item_id.startswith("EMER-"):
+        return EMERGENCY_DRUG_CATEGORY
+    return candidate
+
+
+def make_unique_stock_ids(df: pd.DataFrame) -> pd.Series:
+    generated: list[str] = []
+    used: set[str] = set()
+    next_numbers = {
+        VACCINE_CATEGORY: 1,
+        EMERGENCY_DRUG_CATEGORY: 1,
+    }
+
+    for _, row in df.iterrows():
+        candidate = str(row.get("id", "")).strip()
+        category = normalize_stock_category(row.get(VACCINE_CATEGORY_COLUMN, VACCINE_CATEGORY))
+
+        if candidate.lower() in {"", "nan", "none"}:
+            prefix = "EMER" if category == EMERGENCY_DRUG_CATEGORY else "VAX"
+            candidate = f"{prefix}-{next_numbers[category]:03d}"
+            while candidate in used:
+                next_numbers[category] += 1
+                candidate = f"{prefix}-{next_numbers[category]:03d}"
+            next_numbers[category] += 1
+        else:
+            original = candidate
+            suffix = 2
+            while candidate in used:
+                candidate = f"{original}-{suffix}"
+                suffix += 1
+
+        used.add(candidate)
+        generated.append(candidate)
+
+    return pd.Series(generated, index=df.index)
+
+
+def clean_inventory_data(
+    raw_df: pd.DataFrame | None,
+    *,
+    blank_id_template: str | None = None,
+    extra_text_columns: tuple[str, ...] = (),
+    id_generator: Callable[[pd.DataFrame], pd.Series] | None = None,
+) -> pd.DataFrame:
     if raw_df is None or raw_df.empty:
         return empty_inventory_frame()
 
@@ -133,7 +187,11 @@ def clean_inventory_data(raw_df: pd.DataFrame | None, *, blank_id_template: str)
         if column not in df.columns:
             df[column] = ""
 
-    for column in TEXT_COLUMNS:
+    for column in extra_text_columns:
+        if column not in df.columns:
+            df[column] = ""
+
+    for column in (*TEXT_COLUMNS, *extra_text_columns):
         df[column] = df[column].fillna("").astype(str).str.strip()
 
     df["expiry_date"] = df["expiry_date"].map(normalize_expiry_text)
@@ -146,14 +204,25 @@ def clean_inventory_data(raw_df: pd.DataFrame | None, *, blank_id_template: str)
             .astype(int)
         )
 
-    df["id"] = make_unique_ids(df["id"], blank_id_template=blank_id_template)
+    if id_generator is not None:
+        df["id"] = id_generator(df)
+    elif blank_id_template is not None:
+        df["id"] = make_unique_ids(df["id"], blank_id_template=blank_id_template)
 
     ordered_columns = BASE_COLUMNS + [column for column in df.columns if column not in BASE_COLUMNS]
     return df[ordered_columns].reset_index(drop=True)
 
 
 def clean_stock_data(raw_df: pd.DataFrame | None) -> pd.DataFrame:
-    return clean_inventory_data(raw_df, blank_id_template="VAX-{index:03d}")
+    df = clean_inventory_data(
+        raw_df,
+        extra_text_columns=(VACCINE_CATEGORY_COLUMN,),
+        id_generator=make_unique_stock_ids,
+    )
+    if VACCINE_CATEGORY_COLUMN not in df.columns:
+        df[VACCINE_CATEGORY_COLUMN] = VACCINE_CATEGORY
+    df[VACCINE_CATEGORY_COLUMN] = df.apply(resolve_stock_category, axis=1)
+    return df
 
 
 def clean_consumables_data(raw_df: pd.DataFrame | None) -> pd.DataFrame:
@@ -357,6 +426,11 @@ def load_inventory_log_data(conn: GSheetsConnection, log_worksheet_name: str) ->
     return trimmed.reset_index(drop=True)
 
 
+@st.cache_data(ttl=3600, show_spinner=False)
+def load_inventory_log_data_cached(_conn: GSheetsConnection, log_worksheet_name: str) -> pd.DataFrame:
+    return load_inventory_log_data(_conn, log_worksheet_name)
+
+
 def aggregate_vaccine_log_by_day(log_df: pd.DataFrame) -> pd.DataFrame:
     if log_df.empty:
         return pd.DataFrame(columns=["day", "doses_given", "rolling_average"])
@@ -370,6 +444,44 @@ def aggregate_vaccine_log_by_day(log_df: pd.DataFrame) -> pd.DataFrame:
     )
     daily_df["rolling_average"] = daily_df["doses_given"].rolling(window=7, min_periods=1).mean()
     return daily_df
+
+
+def aggregate_inventory_log_by_month(log_df: pd.DataFrame) -> pd.DataFrame:
+    if log_df.empty:
+        return pd.DataFrame(columns=["month", "doses_given"])
+
+    monthly_item_df = (
+        log_df.assign(
+            item_id=log_df["vaccine_id"].replace("", pd.NA).fillna(log_df["brand_name"]),
+            month=log_df["timestamp"].dt.to_period("M").dt.to_timestamp(),
+        )
+        .groupby(["month", "item_id"], as_index=False)["doses_given"]
+        .sum()
+    )
+    return (
+        monthly_item_df.groupby("month", as_index=False)["doses_given"]
+        .sum()
+        .sort_values("month")
+        .reset_index(drop=True)
+    )
+
+
+def monthly_usage_series_for_item(log_df: pd.DataFrame, item_id: str) -> list[float] | None:
+    if log_df.empty:
+        return None
+
+    item_log_df = log_df[log_df["vaccine_id"] == item_id].copy()
+    if item_log_df.empty:
+        return None
+
+    item_monthly_df = (
+        item_log_df.assign(month=item_log_df["timestamp"].dt.to_period("M").dt.to_timestamp())
+        .groupby("month", as_index=False)["doses_given"]
+        .sum()
+        .sort_values("month")
+        .reset_index(drop=True)
+    )
+    return item_monthly_df["doses_given"].astype(float).tolist()
 
 
 def state_key(section_name: str, suffix: str) -> str:
@@ -466,8 +578,8 @@ def apply_consumables_snapshot(
     apply_inventory_snapshot("consumables", snapshot, flash_kind=flash_kind, flash_message=flash_message)
 
 
-def set_flash(kind: str, message: str, icon: str | None = None) -> None:
-    st.session_state["flash"] = {"kind": kind, "message": message, "icon": icon}
+def set_flash(kind: str, message: str, icon: str | None = None, color: str | None = None) -> None:
+    st.session_state["flash"] = {"kind": kind, "message": message, "icon": icon, "color": color}
 
 
 def set_toast(message: str, icon: str | None = None) -> None:
@@ -482,13 +594,30 @@ def initialize_app_state(conn: GSheetsConnection) -> None:
         apply_snapshot(fetch_snapshot(conn, selected_worksheet_name()))
     if state_key("consumables", "data") not in st.session_state:
         apply_consumables_snapshot(fetch_consumables_snapshot(conn))
+    if state_key("vaccine", "log_data") not in st.session_state:
+        st.session_state[state_key("vaccine", "log_data")] = load_inventory_log_data_cached(conn, LOG_WORKSHEET_NAME)
+    if state_key("consumables", "log_data") not in st.session_state:
+        st.session_state[state_key("consumables", "log_data")] = load_inventory_log_data_cached(
+            conn, CONSUMABLES_LOG_WORKSHEET_NAME
+        )
 
 
 def show_flash_message() -> None:
     flash = st.session_state.pop("flash", None)
     if not flash:
         return
+    if flash["kind"] == "badge":
+        st.badge(flash["message"], icon=flash.get("icon"), color=flash.get("color") or "blue")
+        return
     getattr(st, flash["kind"])(flash["message"], icon=flash.get("icon"))
+
+
+def show_sidebar_status_badges() -> None:
+    flash = st.session_state.get("flash")
+    if flash and flash["kind"] == "badge":
+        st.session_state.pop("flash", None)
+        st.badge(flash["message"], icon=flash.get("icon"), color=flash.get("color") or "blue")
+    source_banner()
 
 
 def show_toast_message() -> None:
@@ -539,6 +668,11 @@ def filter_inventory_cards(stock_df: pd.DataFrame, query: str) -> pd.DataFrame:
         | stock_df["brand_name"].map(normalized_sort_text).str.contains(normalized_query, regex=False)
         | stock_df["generic_name"].map(normalized_sort_text).str.contains(normalized_query, regex=False)
     )
+    if VACCINE_CATEGORY_COLUMN in stock_df.columns:
+        match_mask = match_mask | stock_df[VACCINE_CATEGORY_COLUMN].map(normalized_sort_text).str.contains(
+            normalized_query,
+            regex=False,
+        )
     return stock_df[match_mask].reset_index(drop=True)
 
 
@@ -551,7 +685,12 @@ def source_banner() -> None:
         if not message:
             continue
         if source_kind == "google":
-            st.success(f"{label}: {message}")
+            badge_label = message.removeprefix(":material/database_upload: ").strip()
+            st.badge(
+                f"{label}: {badge_label}",
+                icon=":material/database_upload:",
+                color="blue",
+            )
         elif source_kind == "sample":
             st.warning(f"{label}: {message}")
         else:
@@ -617,6 +756,10 @@ def render_title_banner() -> None:
         }}
         .hero-title {{
             margin: 0;
+            display: flex;
+            flex-wrap: wrap;
+            align-items: flex-end;
+            gap: 0.08em;
             font-family: "Inter", sans-serif;
             font-size: 2.8rem;
             font-weight: 900;
@@ -624,6 +767,55 @@ def render_title_banner() -> None:
             letter-spacing: -0.04em;
             margin-bottom: 0.55rem;
             color: {banner_text_color};
+        }}
+        .hero-title-static {{
+            white-space: nowrap;
+        }}
+        .hero-title-rotator {{
+            position: relative;
+            display: inline-block;
+            min-width: 12.5ch;
+            height: 1em;
+            overflow: visible;
+            transform: translateY(-0.03em);
+        }}
+        .hero-title-word {{
+            position: absolute;
+            inset: 0;
+            opacity: 0;
+            animation: hero-title-fade 9s infinite;
+            white-space: nowrap;
+        }}
+        .hero-title-word:nth-child(1) {{
+            animation-delay: 0s;
+        }}
+        .hero-title-word:nth-child(2) {{
+            animation-delay: 3s;
+        }}
+        .hero-title-word:nth-child(3) {{
+            animation-delay: 6s;
+        }}
+        @keyframes hero-title-fade {{
+            0% {{
+                opacity: 0;
+                transform: translateY(0.18em);
+            }}
+            8% {{
+                opacity: 1;
+                transform: translateY(0);
+            }}
+            25% {{
+                opacity: 1;
+                transform: translateY(0);
+            }}
+            33% {{
+                opacity: 0;
+                transform: translateY(-0.14em);
+            }}
+            100% {{
+                opacity: 0;
+                transform: translateY(-0.14em);
+            }}
         }}
         .hero-subtitle {{
             margin: 0;
@@ -645,6 +837,9 @@ def render_title_banner() -> None:
                 font-size: 2rem;
                 margin-bottom: 0.45rem;
             }}
+            .hero-title-rotator {{
+                min-width: 10.8ch;
+            }}
             .hero-subtitle {{
                 font-size: 0.88rem;
             }}
@@ -653,9 +848,16 @@ def render_title_banner() -> None:
 
         <section class="hero-card">
             <div class="hero-kicker">Stanhope Mews Surgery</div>
-            <h1 class="hero-title">StockVax</h1>
+            <h1 class="hero-title">
+                <span class="hero-title-static">Stock</span>
+                <span class="hero-title-rotator" aria-label="Vax, EmergRx, Consumables">
+                    <span class="hero-title-word">Vax</span>
+                    <span class="hero-title-word">EmergRx</span>
+                    <span class="hero-title-word">Consumables</span>
+                </span>
+            </h1>
             <p class="hero-subtitle">
-                Live surgery vaccine and consumables inventory powered by Google Sheets & Streamlit, with clear reorder and expiry visibility. Code by janduplessis883.
+                Live surgery vaccine, emergency drugs and consumables inventory powered by Python & Streamlit, with clear reorder and expiry visibility.
             </p>
         </section>
         """.format(
@@ -668,15 +870,85 @@ def render_title_banner() -> None:
 
 def render_sidebar(conn: GSheetsConnection) -> None:
     st.sidebar.header("Sheet connection")
-    st.sidebar.text_input(
-        "Vaccine worksheet name",
-        key="worksheet_name",
-        help="Leave blank to use the first vaccine worksheet tab in the spreadsheet from .streamlit/secrets.toml. Consumables always use the 'consumables' tab.",
-        placeholder="First worksheet tab",
-    )
+    with st.sidebar:
+        st.html(
+            """
+            <style>
+            .sidebar-bars-wrap {
+                width: 100%;
+                padding: 0.25rem 0 0.9rem;
+                background: transparent;
+            }
+            .sidebar-bars {
+                display: flex;
+                justify-content: space-between;
+                align-items: flex-end;
+                gap: 0.2rem;
+                height: 5.8rem;
+                width: 100%;
+                padding: 0 0.5rem;
+                box-sizing: border-box;
+                background: transparent;
+            }
+            .sidebar-bars span {
+                flex: 1 1 0;
+                max-width: 0.95rem;
+                height: 2.1rem;
+                border-radius: 999px;
+                background: linear-gradient(180deg, rgba(233, 136, 117, 0.98) 0%, rgba(219, 102, 83, 0.92) 100%);
+                box-shadow: 0 0 0.8rem rgba(219, 102, 83, 0.18);
+                transform-origin: center bottom;
+                animation: sidebar-bars-rise 3s infinite ease-in-out;
+            }
+            .sidebar-bars span:nth-child(2n) {
+                background: linear-gradient(180deg, rgba(219, 102, 83, 0.95) 0%, rgba(198, 79, 59, 0.88) 100%);
+            }
+            .sidebar-bars span:nth-child(3n) {
+                background: linear-gradient(180deg, rgba(245, 162, 145, 0.98) 0%, rgba(219, 102, 83, 0.9) 100%);
+            }
+            .sidebar-bars span:nth-child(1) { animation-delay: 0s; }
+            .sidebar-bars span:nth-child(2) { animation-delay: 0.16s; }
+            .sidebar-bars span:nth-child(3) { animation-delay: 0.32s; }
+            .sidebar-bars span:nth-child(4) { animation-delay: 0.48s; }
+            .sidebar-bars span:nth-child(5) { animation-delay: 0.64s; }
+            .sidebar-bars span:nth-child(6) { animation-delay: 0.8s; }
+            .sidebar-bars span:nth-child(7) { animation-delay: 0.96s; }
+            .sidebar-bars span:nth-child(8) { animation-delay: 1.12s; }
+            .sidebar-bars span:nth-child(9) { animation-delay: 1.28s; }
+            .sidebar-bars span:nth-child(10) { animation-delay: 1.44s; }
+
+            @keyframes sidebar-bars-rise {
+                0%, 100% {
+                    height: 2.1rem;
+                    opacity: 0.72;
+                    filter: saturate(0.96) brightness(0.98);
+                }
+                50% {
+                    height: 5.15rem;
+                    opacity: 1;
+                    filter: saturate(1.06) brightness(1.05);
+                }
+            }
+            </style>
+            <div class="sidebar-bars-wrap" aria-hidden="true">
+                <div class="sidebar-bars">
+                    <span></span>
+                    <span></span>
+                    <span></span>
+                    <span></span>
+                    <span></span>
+                    <span></span>
+                    <span></span>
+                    <span></span>
+                    <span></span>
+                    <span></span>
+                </div>
+            </div>
+            """
+        )
+        show_sidebar_status_badges()
 
     refresh_clicked = st.sidebar.button("Refresh from Google Sheet", width="stretch")
-    sample_clicked = st.sidebar.button("Load sample data locally", width="stretch", disabled=True)
 
     st.sidebar.caption("Editor saves rewrite the relevant table in Google Sheets, so avoid concurrent edits in multiple browser sessions.")
 
@@ -685,46 +957,98 @@ def render_sidebar(conn: GSheetsConnection) -> None:
             fetch_snapshot(conn, selected_worksheet_name()),
         )
         apply_consumables_snapshot(fetch_consumables_snapshot(conn))
-        set_flash("info", ":material/refresh: Vaccine and consumables data refreshed from Google Sheets.")
-        st.rerun()
-
-    if sample_clicked:
-        apply_snapshot(
-            StockSnapshot(
-                data=clean_stock_data(load_sample_stock()),
-                source_kind="sample",
-                message="Sample data is loaded locally. Nothing has been written back to Google Sheets yet.",
-            ),
-            flash_kind="info",
-            flash_message="Sample stock data loaded into the editor.",
+        set_flash(
+            "badge",
+            "Data refreshed from Sheets.",
+            icon=":material/refresh:",
+            color="yellow",
         )
         st.rerun()
+
+    with st.sidebar:
+        st.html(
+            """
+            <style>
+            .sidebar-signature-wrap {
+                margin-top: 1rem;
+                padding-bottom: 0.25rem;
+                display: flex;
+                justify-content: center;
+            }
+            .sidebar-signature-pill {
+                width: 50%;
+                border-radius: 999px;
+                background: #ffffff;
+                color: #51585f;
+                text-align: center;
+                font-size: 0.78rem;
+                font-weight: 900;
+                letter-spacing: -0.03em;
+                line-height: 1;
+                padding: 0.55rem 0.75rem;
+                box-shadow: 0 6px 12px rgba(14, 23, 33, 0.12);
+                border: 1px solid rgba(14, 23, 33, 0.06);
+                transition:
+                    background-color 180ms ease,
+                    color 180ms ease,
+                    transform 180ms ease,
+                    box-shadow 180ms ease,
+                    border-color 180ms ease;
+            }
+            .sidebar-signature-pill:hover {
+                background: #db6653;
+                color: #f4f6f2;
+                transform: translateY(8px);
+                box-shadow: 0 2px 0 rgba(14, 23, 33, 0.08);
+                border-color: 1px solid rgba(14, 23, 33, 0.12);
+            }
+            .sidebar-signature-pill:active {
+                background: #ffffff;
+                color: #e49988;
+            }
+            </style>
+            <BR><BR><BR><BR>
+            <div class="sidebar-signature-wrap">
+                <div class="sidebar-signature-pill">janduplessis883</div>
+            </div>
+            """
+        )
 
 
 def render_metrics(
     stock_df: pd.DataFrame,
+    log_df: pd.DataFrame,
     *,
     tracked_label: str,
     on_hand_label: str,
 ) -> None:
     total_stock = int(stock_df["stock_level"].sum())
+    total_expected_monthly_use = int(stock_df["expected_monthly_use"].sum())
     low_stock_count = int(stock_df["status"].isin(["Reorder", "Out of stock"]).sum())
     expiring_count = int(
         ((stock_df["days_until_expiry"] <= 90) & (stock_df["days_until_expiry"] >= 0) & (stock_df["stock_level"] > 0)).sum()
     )
     months_of_cover = (
-        round(total_stock / stock_df["expected_monthly_use"].sum(), 1)
-        if int(stock_df["expected_monthly_use"].sum()) > 0
+        round(total_stock / total_expected_monthly_use, 1)
+        if total_expected_monthly_use > 0
         else 0
     )
+    stock_delta = total_stock - total_expected_monthly_use if total_expected_monthly_use > 0 else None
+    monthly_usage_df = aggregate_inventory_log_by_month(log_df)
+    monthly_usage_data = monthly_usage_df["doses_given"].tolist() if not monthly_usage_df.empty else None
 
     metric_columns = st.columns(4)
     metric_columns[0].metric(tracked_label, len(stock_df))
-    metric_columns[1].metric(on_hand_label, total_stock)
+    metric_columns[1].metric(
+        on_hand_label,
+        total_stock,
+        delta=stock_delta,
+        delta_description="vs expected monthly use",
+    )
     metric_columns[2].metric("Need action", low_stock_count)
     metric_columns[3].metric("Months of cover", months_of_cover)
 
-    st.caption(f"Expiring in the next 90 days: {expiring_count}")
+    st.badge(f":material/gpp_bad: Expiring in the next 90 days: **{expiring_count}**", color="yellow")
 
 
 def watchlist_row_styles(row: pd.Series, table_kind: str) -> list[str]:
@@ -929,7 +1253,7 @@ def render_inventory_activity_plot(
     )
 
     area = base.mark_area(
-        line={"color": primary_color, "strokeWidth": 2.6},
+        line={"color": primary_color, "strokeWidth": 1.5},
         color=alt.Gradient(
             gradient="linear",
             stops=[
@@ -974,7 +1298,7 @@ def render_inventory_activity_plot(
     trend_line = base.mark_line(
         color=accent_color,
         strokeDash=[8, 6],
-        strokeWidth=2.4,
+        strokeWidth=1.5,
     ).encode(
         y="rolling_average:Q",
         tooltip=[
@@ -985,7 +1309,7 @@ def render_inventory_activity_plot(
 
     peak_highlight = (
         alt.Chart(pd.DataFrame([peak_day]))
-        .mark_point(shape="diamond", filled=True, size=280, color=accent_color, stroke="white", strokeWidth=1.5)
+        .mark_point(shape="diamond", filled=True, size=280, color=accent_color, stroke="white", strokeWidth=1)
         .encode(
             x="day:T",
             y="doses_given:Q",
@@ -1037,8 +1361,8 @@ def render_inventory_activity_plot(
 
 
 def render_inventory_overview(
-    conn: GSheetsConnection,
     stock_df: pd.DataFrame,
+    log_df: pd.DataFrame,
     *,
     section_title: str,
     tracked_label: str,
@@ -1050,7 +1374,7 @@ def render_inventory_overview(
     stock_chart_colors: tuple[str, str],
     activity_chart_colors: tuple[str, str],
 ) -> None:
-    render_metrics(stock_df, tracked_label=tracked_label, on_hand_label=on_hand_label)
+    render_metrics(stock_df, log_df, tracked_label=tracked_label, on_hand_label=on_hand_label)
 
     reorder_df = stock_df[stock_df["status"].isin(["Reorder", "Out of stock"])].copy()
     reorder_df = reorder_df.sort_values(["status", "suggested_order_qty", "brand_name"], ascending=[True, False, True])
@@ -1125,7 +1449,7 @@ def render_inventory_overview(
         value_label=value_label,
     )
     render_inventory_activity_plot(
-        load_inventory_log_data(conn, log_worksheet_name),
+        log_df,
         title=f"Daily {item_label_plural.lower()} activity",
         empty_message=f"No {item_label_plural.lower()} activity has been logged yet.",
         item_label_plural=item_label_plural,
@@ -1275,7 +1599,7 @@ def give_vaccine_dose(conn: GSheetsConnection, vaccine_id: str) -> None:
         log_worksheet_name=LOG_WORKSHEET_NAME,
         cleaner=clean_stock_data,
         snapshot_applier=apply_snapshot,
-        item_label_singular="Vaccine",
+        item_label_singular="Emergency drug" if vaccine_id.startswith("EMER-") else "Vaccine",
         action_word="given",
         toast_icon=":material/syringe:",
     )
@@ -1296,9 +1620,10 @@ def use_consumable(conn: GSheetsConnection, consumable_id: str) -> None:
 
 
 def render_inventory_action_tab(
-    conn: GSheetsConnection,
     stock_df: pd.DataFrame,
+    log_df: pd.DataFrame,
     *,
+    conn: GSheetsConnection,
     cleaner: Callable[[pd.DataFrame | None], pd.DataFrame],
     expander_title: str,
     section_subheader: str,
@@ -1313,6 +1638,7 @@ def render_inventory_action_tab(
     brand_font_size: str = "2.0rem",
     generic_font_size: str = "0.95rem",
     expiry_font_size: str = "1.5rem",
+    split_vaccine_categories: bool = False,
 ) -> None:
     with st.expander(expander_title, icon=":material/bar_chart:"):
         render_stock_usage_plot(
@@ -1398,6 +1724,12 @@ def render_inventory_action_tab(
             color: #ec5d4b;
             box-shadow: 0 4px 12px rgba(236, 93, 75, 0.14);
         }}
+        .nurse-expiry-pill.is-expired {{
+            background: rgba(236, 93, 75, 0.12);
+            border-color: rgba(236, 93, 75, 0.62);
+            color: #ec5d4b;
+            box-shadow: 0 4px 12px rgba(236, 93, 75, 0.12);
+        }}
         </style>
         """
     )
@@ -1411,87 +1743,126 @@ def render_inventory_action_tab(
             st.info(empty_message)
         return
 
-    card_columns = st.columns(3)
+    def render_card_group(group_df: pd.DataFrame, *, title: str, empty_group_message: str) -> None:
+        st.markdown(f"### {title}")
+        if group_df.empty:
+            st.info(empty_group_message)
+            return
 
-    for index, (_, row) in enumerate(display_df.iterrows()):
-        with card_columns[index % 3]:
-            with st.container(border=True):
-                brand_name = row["brand_name"] or row["generic_name"] or "Unnamed item"
-                generic_name = row["generic_name"] or "No description"
-                stock_level = int(row["stock_level"])
-                order_level = int(row["order_level"])
-                today = pd.Timestamp.today().normalize()
-                expiry_dt = parse_expiry_date(row["expiry_date"])
-                expiry_display = format_expiry_display(row["expiry_date"])
-                expiry_class = "nurse-expiry-pill"
-                if pd.notna(expiry_dt):
-                    if expiry_dt <= (today + pd.DateOffset(months=1)):
-                        expiry_class = "nurse-expiry-pill is-urgent"
-                    elif expiry_dt <= (today + pd.DateOffset(months=3)):
-                        expiry_class = "nurse-expiry-pill is-warning"
-                expiry_markup = (
-                    f'<div class="{expiry_class}">{html.escape(expiry_display)}</div>'
-                    if expiry_display
-                    else ""
-                )
+        card_columns = st.columns(3)
 
-                st.markdown(
-                    f"""
-                    <div class="nurse-card-header">
-                        <div class="nurse-card-title-block">
-                            <div class="nurse-brand-name">{html.escape(brand_name)}</div>
-                            <div class="nurse-generic-name">{html.escape(generic_name)}</div>
+        for index, (_, row) in enumerate(group_df.iterrows()):
+            with card_columns[index % 3]:
+                with st.container(border=True):
+                    brand_name = row["brand_name"] or row["generic_name"] or "Unnamed item"
+                    generic_name = row["generic_name"] or "No description"
+                    stock_level = int(row["stock_level"])
+                    order_level = int(row["order_level"])
+                    expected_monthly_use = int(row.get("expected_monthly_use", 0))
+                    stock_delta = stock_level - expected_monthly_use if expected_monthly_use > 0 else None
+                    today = pd.Timestamp.today().normalize()
+                    expiry_dt = parse_expiry_date(row["expiry_date"])
+                    is_expired = pd.notna(expiry_dt) and expiry_dt < today
+                    expiry_display = format_expiry_display(row["expiry_date"])
+                    expiry_class = "nurse-expiry-pill"
+                    if pd.notna(expiry_dt):
+                        if is_expired:
+                            expiry_class = "nurse-expiry-pill is-expired"
+                        elif expiry_dt <= (today + pd.DateOffset(months=1)):
+                            expiry_class = "nurse-expiry-pill is-urgent"
+                        elif expiry_dt <= (today + pd.DateOffset(months=3)):
+                            expiry_class = "nurse-expiry-pill is-warning"
+                    expiry_markup = (
+                        f'<div class="{expiry_class}">{html.escape(expiry_display)}</div>'
+                        if expiry_display
+                        else ""
+                    )
+
+                    st.markdown(
+                        f"""
+                        <div class="nurse-card-header">
+                            <div class="nurse-card-title-block">
+                                <div class="nurse-brand-name">{html.escape(brand_name)}</div>
+                                <div class="nurse-generic-name">{html.escape(generic_name)}</div>
+                            </div>
+                            {expiry_markup}
                         </div>
-                        {expiry_markup}
-                    </div>
-                    """,
-                    unsafe_allow_html=True,
-                )
+                        """,
+                        unsafe_allow_html=True,
+                    )
 
-                detail_columns = st.columns(2)
-                detail_columns[0].metric("Stock", f"{stock_level}")
-                detail_columns[1].metric(":gray[Order level]", f":gray[{order_level}]")
+                    detail_columns = st.columns(2)
+                    detail_columns[0].metric(
+                        "Stock",
+                        f"{stock_level}",
+                        delta=stock_delta,
+                    )
+                    detail_columns[1].metric(":gray[Order level]", f":gray[{order_level}]")
 
-                if stock_level <= 0:
-                    st.error("Out of stock", icon=":material/error:")
-                elif stock_level <= order_level and order_level > 0:
-                    st.warning("Low stock / Reorder", icon=":material/warning:")
-                else:
-                    st.info("Ready to record", icon=":material/check_circle:")
+                    if is_expired and stock_level > 0:
+                        st.badge("Vaccine / drug expired", icon=":material/gpp_bad:", color="red", width="stretch")
+                    elif stock_level <= 0:
+                        st.badge("Out of stock", icon=":material/error:", color="red", width="stretch")
+                    elif stock_level <= order_level and order_level > 0:
+                        st.badge("Low stock / Reorder", icon=":material/warning:", color="yellow", width="stretch")
+                    else:
+                        st.badge("Ready to record", icon=":material/check_circle:", color="blue", width="stretch")
 
-                if st.button(
-                    button_label,
-                    key=f"{button_key_prefix}_{row['id']}",
-                    type="primary",
-                    icon=button_icon,
-                    disabled=stock_level <= 0,
-                    width="stretch",
-                ):
-                    on_click(conn, row["id"])
+                    if st.button(
+                        button_label,
+                        key=f"{button_key_prefix}_{row['id']}",
+                        type="primary",
+                        icon=button_icon,
+                        disabled=stock_level <= 0 or is_expired,
+                        width="stretch",
+                    ):
+                        on_click(conn, row["id"])
+
+    if split_vaccine_categories:
+        category_series = display_df.apply(resolve_stock_category, axis=1)
+        vaccine_display_df = display_df[category_series != EMERGENCY_DRUG_CATEGORY].reset_index(drop=True)
+        emergency_display_df = display_df[category_series == EMERGENCY_DRUG_CATEGORY].reset_index(drop=True)
+        groups_to_render: list[tuple[pd.DataFrame, str, str]] = [
+            (vaccine_display_df, "VACCINES", "No vaccines match the current view."),
+            (emergency_display_df, "EMERGENCY DRUGS", "No emergency drugs match the current view."),
+        ]
+        if len(search_query.strip()) >= 2:
+            groups_to_render = [group for group in groups_to_render if not group[0].empty]
+
+        for index, (group_df, title, empty_group_message) in enumerate(groups_to_render):
+            if index > 0:
+                st.divider()
+            render_card_group(group_df, title=title, empty_group_message=empty_group_message)
+        return
+
+    render_card_group(display_df, title=section_subheader, empty_group_message=empty_message)
 
 
-def render_nurse_tab(conn: GSheetsConnection, stock_df: pd.DataFrame) -> None:
+def render_nurse_tab(conn: GSheetsConnection, stock_df: pd.DataFrame, log_df: pd.DataFrame) -> None:
     render_inventory_action_tab(
-        conn,
         stock_df,
+        log_df,
+        conn=conn,
         cleaner=clean_stock_data,
-        expander_title="Stock usage bar plot",
+        expander_title="Vaccine and emergency drug stock usage bar plot",
         section_subheader="Nurse recording",
-        chart_item_label="Vaccine",
-        caption="Keep this tab open during clinic. One click records one vaccine given and updates the live stock level immediately.",
+        chart_item_label="Stock item",
+        caption="Keep this tab open during clinic. One click records one vaccine or emergency drug given and updates the live stock level immediately.",
         empty_message="No vaccines are available in the stock list yet.",
         button_label="Record 1 given",
         button_icon=":material/syringe:",
         button_key_prefix="give_dose",
         on_click=give_vaccine_dose,
         chart_colors=VACCINE_STOCK_COLORS,
+        split_vaccine_categories=True,
     )
 
 
-def render_consumables_tab(conn: GSheetsConnection, stock_df: pd.DataFrame) -> None:
+def render_consumables_tab(conn: GSheetsConnection, stock_df: pd.DataFrame, log_df: pd.DataFrame) -> None:
     render_inventory_action_tab(
-        conn,
         stock_df,
+        log_df,
+        conn=conn,
         cleaner=clean_consumables_data,
         expander_title="Consumables stock usage bar plot",
         section_subheader="Consumables recording",
@@ -1579,7 +1950,7 @@ def record_delivery(
                 StockSnapshot(
                     data=vaccine_df,
                     source_kind="google",
-                    message="Live data loaded from Google Sheets.",
+                    message="Live data loaded from Sheets.",
                 ),
             )
             completed_sections.append("vaccines")
@@ -1797,6 +2168,11 @@ def render_editor_section(
                 format="%d",
             ),
             "order_level": st.column_config.NumberColumn("Order level", min_value=0, step=1, format="%d"),
+            "category": st.column_config.SelectboxColumn(
+                "Category",
+                options=[VACCINE_CATEGORY, EMERGENCY_DRUG_CATEGORY],
+                required=False,
+            ),
         },
     )
 
@@ -1895,17 +2271,18 @@ def render_app() -> None:
     initialize_app_state(conn)
     render_sidebar(conn)
     show_flash_message()
-    source_banner()
 
     raw_stock = clean_stock_data(st.session_state.get(state_key("vaccine", "data")))
     stock_with_metrics = add_inventory_metrics(raw_stock, cleaner=clean_stock_data)
     raw_consumables = clean_consumables_data(st.session_state.get(state_key("consumables", "data")))
     consumables_with_metrics = add_inventory_metrics(raw_consumables, cleaner=clean_consumables_data)
+    vaccine_log_df = st.session_state.get(state_key("vaccine", "log_data"), pd.DataFrame())
+    consumables_log_df = st.session_state.get(state_key("consumables", "log_data"), pd.DataFrame())
 
     navigation_options = [
-        "Record VACCINE use",
-        "Record CONSUMABLES use",
-        "Vaccine overview",
+        "VACCINE | EMERGENCY Rx",
+        "CONSUMABLES",
+        "Vaccine | Emergency Rx overview",
         "Consumables overview",
         "Record delivery",
         "Stock editor",
@@ -1930,16 +2307,16 @@ def render_app() -> None:
         """
     )
 
-    if active_section == "Record VACCINE use":
-        render_nurse_tab(conn, raw_stock)
+    if active_section == "VACCINE | EMERGENCY Rx":
+        render_nurse_tab(conn, raw_stock, vaccine_log_df)
 
-    elif active_section == "Record CONSUMABLES use":
-        render_consumables_tab(conn, raw_consumables)
+    elif active_section == "CONSUMABLES":
+        render_consumables_tab(conn, raw_consumables, consumables_log_df)
 
-    elif active_section == "Vaccine overview":
+    elif active_section == "Vaccine | Emergency Rx overview":
         render_inventory_overview(
-            conn,
             stock_with_metrics,
+            vaccine_log_df,
             section_title="Vaccines",
             tracked_label="Vaccines tracked",
             on_hand_label="Doses on hand",
@@ -1953,8 +2330,8 @@ def render_app() -> None:
 
     elif active_section == "Consumables overview":
         render_inventory_overview(
-            conn,
             consumables_with_metrics,
+            consumables_log_df,
             section_title="Consumables",
             tracked_label="Consumables tracked",
             on_hand_label="Items on hand",
