@@ -2380,19 +2380,18 @@ def render_restock_mode(conn: GSheetsConnection) -> None:
             border: 1px solid rgba(12, 23, 34, 0.08);
             border-radius: 24px;
             padding: 1.15rem 1rem 1rem;
-            box-shadow: 0 18px 40px rgba(12, 23, 34, 0.08);
         }
         .restock-eyebrow {
             display: inline-flex;
             align-items: center;
             justify-content: center;
-            min-height: 2.6rem;
-            padding: 0.15rem 1rem;
+            min-height: 2.9rem;
+            padding: 0.2rem 1.15rem;
             border-radius: 999px;
             background: rgba(219, 102, 83, 0.1);
             border: 1px solid rgba(219, 102, 83, 0.12);
             color: #cf4c34;
-            font-size: 0.98rem;
+            font-size: 1.05rem;
             font-weight: 800;
             letter-spacing: 0.02em;
             text-transform: uppercase;
@@ -2418,6 +2417,9 @@ def render_restock_mode(conn: GSheetsConnection) -> None:
             font-size: 0.98rem;
             font-weight: 600;
             margin: 0.1rem 0 0.3rem;
+        }
+        .restock-expiry-block {
+            margin: 0.15rem 0 0.9rem;
         }
         </style>
         <div class="restock-shell">
@@ -2446,11 +2448,35 @@ def render_restock_mode(conn: GSheetsConnection) -> None:
     item_description = row["generic_name"] or item_label
     current_stock = int(row["stock_level"])
     expiry_display = format_expiry_display(row["expiry_date"])
-    expiry_month_placeholder = expiry_display[:2] if expiry_display else "MM"
-    expiry_year_placeholder = expiry_display[3:] if expiry_display else "YY"
+    expiry_month_value = int(expiry_display[:2]) if expiry_display else 1
+    expiry_year_value = int(expiry_display[3:]) if expiry_display else 0
 
     st.markdown(f"<div class='restock-title'>{html.escape(item_name)}</div>", unsafe_allow_html=True)
     st.markdown(f"<div class='restock-subtitle'>{html.escape(item_description)}</div>", unsafe_allow_html=True)
+
+    st.markdown("<div class='restock-expiry-block'>", unsafe_allow_html=True)
+    expiry_month_column, expiry_year_column = st.columns(2)
+    with expiry_month_column:
+        expiry_month = st.number_input(
+            "MM",
+            min_value=1,
+            max_value=12,
+            value=expiry_month_value,
+            step=1,
+            format="%02d",
+            width="stretch",
+        )
+    with expiry_year_column:
+        expiry_year = st.number_input(
+            "YY",
+            min_value=0,
+            max_value=99,
+            value=expiry_year_value,
+            step=1,
+            format="%02d",
+            width="stretch",
+        )
+    st.markdown("</div>", unsafe_allow_html=True)
 
     badge_columns = st.columns(2)
     badge_columns[0].badge(f"ID: {item_id}", color="blue", width="stretch")
@@ -2459,51 +2485,13 @@ def render_restock_mode(conn: GSheetsConnection) -> None:
         color="green" if current_stock > 0 else "red",
         width="stretch",
     )
-    if expiry_display:
-        is_expired = pd.notna(parse_expiry_date(row["expiry_date"])) and parse_expiry_date(row["expiry_date"]) < pd.Timestamp.today().normalize()
-        st.badge(
-            f"Expiry: {expiry_display}",
-            color="red" if is_expired else "gray",
-            width="stretch",
-        )
 
-    with st.form("qr_restock_form", clear_on_submit=True, width="stretch"):
-        st.markdown("<div class='restock-row-label'>Expiry</div>", unsafe_allow_html=True)
-        expiry_label_column, expiry_month_column, expiry_year_column = st.columns([1.15, 1, 1])
-        with expiry_label_column:
-            st.badge(f"Expiry: {expiry_display or 'Not set'}", color="gray", width="stretch")
-        with expiry_month_column:
-            expiry_month = st.number_input(
-                "MM",
-                min_value=1,
-                max_value=12,
-                value=None,
-                step=1,
-                placeholder=expiry_month_placeholder,
-                width="stretch",
-            )
-        with expiry_year_column:
-            expiry_year = st.number_input(
-                "YY",
-                min_value=0,
-                max_value=99,
-                value=None,
-                step=1,
-                format="%02d",
-                placeholder=expiry_year_placeholder,
-                width="stretch",
-            )
+    with st.form("qr_restock_form", clear_on_submit=False, width="stretch"):
         amount = st.number_input("Amount re-stocked", min_value=1, step=1, value=1, width="stretch")
         submitted = st.form_submit_button("Update stock", type="primary", width="stretch")
 
     if submitted:
-        updated_expiry: str | None = None
-        if expiry_month is not None or expiry_year is not None:
-            if expiry_month is None or expiry_year is None:
-                st.error("Enter both MM and YY to update the expiry date.")
-                st.html("</div></div>")
-                return
-            updated_expiry = f"{int(expiry_month):02d}{int(expiry_year):02d}"
+        updated_expiry = f"{int(expiry_month):02d}{int(expiry_year):02d}"
         try:
             item_label, new_stock, updated_expiry_display = restock_inventory_item(
                 conn,
