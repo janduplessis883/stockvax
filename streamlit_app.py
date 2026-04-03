@@ -32,8 +32,9 @@ EXPIRY_PATTERN = re.compile(r"^\d{4}$")
 LOG_WORKSHEET_NAME = "log"
 CONSUMABLES_WORKSHEET_NAME = "consumables"
 CONSUMABLES_LOG_WORKSHEET_NAME = "consumables_log"
+CONFIG_WORKSHEET_NAME = "config"
 APP_TIMEZONE = "Europe/London"
-RESTOCK_BASE_URL = "https://stockvax-stanhope.streamlit.app"
+DEFAULT_APP_BASE_URL = "https://stockvax-stanhope.streamlit.app"
 VACCINE_CATEGORY_COLUMN = "category"
 VACCINE_CATEGORY = "vaccine"
 EMERGENCY_DRUG_CATEGORY = "emergency_drug"
@@ -440,12 +441,65 @@ def consume_inventory_item(conn: GSheetsConnection, item_id: str, amount: int) -
 
 def app_url_for_item(item_id: str, mode: str) -> str:
     encoded_item_id = quote(item_id.strip().upper(), safe="")
-    return f"{RESTOCK_BASE_URL}/?mode={quote(mode, safe='')}&item_id={encoded_item_id}"
+    return f"{get_qr_base_url()}/?mode={quote(mode, safe='')}&item_id={encoded_item_id}"
 
 
 def qr_image_url_for_item(item_id: str, mode: str) -> str:
     encoded_url = quote(app_url_for_item(item_id, mode), safe="")
     return f"https://api.qrserver.com/v1/create-qr-code/?size=450x450&margin=20&data={encoded_url}"
+
+
+def normalize_qr_base_url(value: object) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    return text.rstrip("/")
+
+
+def get_qr_base_url() -> str:
+    return normalize_qr_base_url(st.session_state.get("qr_base_url")) or DEFAULT_APP_BASE_URL
+
+
+def load_qr_base_url(conn: GSheetsConnection) -> str:
+    try:
+        config_worksheet = select_live_worksheet(conn, CONFIG_WORKSHEET_NAME)
+        return normalize_qr_base_url(config_worksheet.acell("A1").value) or DEFAULT_APP_BASE_URL
+    except WorksheetNotFound:
+        return DEFAULT_APP_BASE_URL
+    except Exception:
+        return DEFAULT_APP_BASE_URL
+
+
+def save_qr_base_url(conn: GSheetsConnection, base_url: str) -> None:
+    config_worksheet = select_live_worksheet(conn, CONFIG_WORKSHEET_NAME)
+    config_worksheet.update_acell("A1", base_url)
+
+
+def queue_qr_base_url_input_sync(base_url: str) -> None:
+    normalized_value = normalize_qr_base_url(base_url) or DEFAULT_APP_BASE_URL
+    st.session_state["qr_base_url"] = normalized_value
+    st.session_state["qr_base_url_input_pending"] = normalized_value
+
+
+def handle_qr_base_url_change(conn: GSheetsConnection) -> None:
+    submitted_value = normalize_qr_base_url(st.session_state.get("qr_base_url_input"))
+    if not submitted_value:
+        queue_qr_base_url_input_sync(get_qr_base_url())
+        set_flash("error", "QR base URL cannot be blank.", icon=":material/error:")
+        return
+    if not re.match(r"^https?://", submitted_value, flags=re.IGNORECASE):
+        queue_qr_base_url_input_sync(get_qr_base_url())
+        set_flash("error", "Enter a full URL starting with http:// or https://", icon=":material/error:")
+        return
+    try:
+        save_qr_base_url(conn, submitted_value)
+    except Exception as exc:
+        queue_qr_base_url_input_sync(get_qr_base_url())
+        set_flash("error", f"Could not save QR base URL: {exc}", icon=":material/error:")
+        return
+
+    queue_qr_base_url_input_sync(submitted_value)
+    set_flash("success", "QR base URL saved to config.", icon=":material/check_circle:")
 
 
 def render_mobile_inventory_shell_open() -> None:
@@ -775,6 +829,13 @@ def set_toast(message: str, icon: str | None = None) -> None:
 def initialize_app_state(conn: GSheetsConnection) -> None:
     if "worksheet_name" not in st.session_state:
         st.session_state["worksheet_name"] = ""
+    if "qr_base_url" not in st.session_state:
+        st.session_state["qr_base_url"] = load_qr_base_url(conn)
+    pending_qr_base_url = st.session_state.pop("qr_base_url_input_pending", None)
+    if pending_qr_base_url is not None:
+        st.session_state["qr_base_url_input"] = pending_qr_base_url
+    if "qr_base_url_input" not in st.session_state:
+        st.session_state["qr_base_url_input"] = st.session_state["qr_base_url"]
 
     if state_key("vaccine", "data") not in st.session_state:
         apply_snapshot(fetch_snapshot(conn, selected_worksheet_name()))
@@ -802,7 +863,7 @@ def show_sidebar_status_badges() -> None:
     flash = st.session_state.get("flash")
     if flash and flash["kind"] == "badge":
         st.session_state.pop("flash", None)
-        st.badge(flash["message"], icon=flash.get("icon"), color=flash.get("color") or "blue")
+        st.success(flash["message"], icon=flash.get("icon"))
     source_banner()
 
 
@@ -872,13 +933,14 @@ def source_banner() -> None:
             continue
         if source_kind == "google":
             badge_label = message.removeprefix(":material/database_upload: ").strip()
-            st.badge(
+            st.success(
                 f"{label}: {badge_label}",
                 icon=":material/database_upload:",
-                color="blue",
             )
         elif source_kind == "sample":
             st.warning(f"{label}: {message}")
+        elif source_kind == "warning":
+            st.error(f"{label}: {message}")
         else:
             st.info(f"{label}: {message}")
 
@@ -1036,9 +1098,9 @@ def render_title_banner() -> None:
             <div class="hero-kicker">Stanhope Mews Surgery</div>
             <h1 class="hero-title">
                 <span class="hero-title-static">Stock</span>
-                <span class="hero-title-rotator" aria-label="Vax, EmergRx, Consumables">
+                <span class="hero-title-rotator" aria-label="Vax, EmergencyRx, Consumables">
                     <span class="hero-title-word">Vax</span>
-                    <span class="hero-title-word">EmergRx</span>
+                    <span class="hero-title-word">EmergencyRx</span>
                     <span class="hero-title-word">Consumables</span>
                 </span>
             </h1>
@@ -1134,6 +1196,15 @@ def render_sidebar(conn: GSheetsConnection) -> None:
         )
         show_sidebar_status_badges()
 
+    st.sidebar.text_input(
+        "QR base URL",
+        key="qr_base_url_input",
+        help="Saved to config!A1 and used for all restock and consume QR codes.",
+        on_change=handle_qr_base_url_change,
+        args=(conn,),
+        placeholder=DEFAULT_APP_BASE_URL,
+    )
+
     refresh_clicked = st.sidebar.button("Refresh from Google Sheet", width="stretch")
 
     st.sidebar.caption("Editor saves rewrite the relevant table in Google Sheets, so avoid concurrent edits in multiple browser sessions.")
@@ -1143,6 +1214,8 @@ def render_sidebar(conn: GSheetsConnection) -> None:
             fetch_snapshot(conn, selected_worksheet_name()),
         )
         apply_consumables_snapshot(fetch_consumables_snapshot(conn))
+        refreshed_qr_base_url = load_qr_base_url(conn)
+        queue_qr_base_url_input_sync(refreshed_qr_base_url)
         set_flash(
             "badge",
             "Data refreshed from Sheets.",
