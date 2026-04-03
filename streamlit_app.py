@@ -2370,6 +2370,9 @@ def render_restock_mode(conn: GSheetsConnection) -> None:
     st.html(
         """
         <style>
+        body {
+            margin: 0;
+        }
         .restock-shell {
             max-width: 32rem;
             margin: 0 auto;
@@ -2458,7 +2461,7 @@ def render_restock_mode(conn: GSheetsConnection) -> None:
 
     st.badge(
         f"Current stock: {current_stock}",
-        color="green" if current_stock > 0 else "red",
+        color="green" if current_stock > 0 else "orange",
         width="stretch",
     )
 
@@ -2467,7 +2470,7 @@ def render_restock_mode(conn: GSheetsConnection) -> None:
         expiry_month_column, expiry_year_column = st.columns(2)
         with expiry_month_column:
             expiry_month = st.number_input(
-                "MM",
+                "Expiry Month (MM)",
                 min_value=1,
                 max_value=12,
                 value=expiry_month_value,
@@ -2477,7 +2480,7 @@ def render_restock_mode(conn: GSheetsConnection) -> None:
             )
         with expiry_year_column:
             expiry_year = st.number_input(
-                "YY",
+                "Expiry Year (YY)",
                 min_value=0,
                 max_value=99,
                 value=expiry_year_value,
@@ -2506,11 +2509,11 @@ def render_restock_mode(conn: GSheetsConnection) -> None:
     st.html("</div></div>")
 
 
-@st.dialog("Item QR Code", width="large")
+@st.dialog("Item QR Code")
 def show_item_qr_dialog(item_id: str, item_name: str, section_title: str) -> None:
     qr_url = qr_image_url_for_item(item_id)
     restock_url = restock_url_for_item(item_id)
-    st.badge(f"{section_title}: {item_id}", color="blue", width="stretch")
+    st.badge(f"{section_title}: {item_id}", color="blue")
     st.markdown(f"### {item_name}")
     st.image(qr_url, width=320)
     st.caption("Scan this code to open the mobile restock page for this item.")
