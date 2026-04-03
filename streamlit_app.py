@@ -2373,7 +2373,7 @@ def render_restock_mode(conn: GSheetsConnection) -> None:
         .restock-shell {
             max-width: 32rem;
             margin: 0 auto;
-            padding: 0.1rem 0 1.5rem;
+            padding: 0 0 1.5rem;
         }
         .restock-card {
             padding: 0 0.15rem 1rem;
@@ -2392,7 +2392,7 @@ def render_restock_mode(conn: GSheetsConnection) -> None:
             font-weight: 800;
             letter-spacing: 0.02em;
             text-transform: uppercase;
-            margin-bottom: 0.35rem;
+            margin-bottom: 0.1rem;
         }
         .restock-title {
             color: #0c1722;
@@ -2400,14 +2400,14 @@ def render_restock_mode(conn: GSheetsConnection) -> None:
             font-weight: 900;
             line-height: 1.02;
             letter-spacing: -0.04em;
-            margin: 0;
+            margin: 0 0 0.12rem;
         }
         .restock-subtitle {
             color: #6b7280;
             font-size: 1rem;
             font-weight: 600;
             line-height: 1.2;
-            margin: 0.25rem 0 0.8rem;
+            margin: 0 0 0.55rem;
         }
         .restock-row-label {
             color: #7d8386;
@@ -2421,7 +2421,6 @@ def render_restock_mode(conn: GSheetsConnection) -> None:
         </style>
         <div class="restock-shell">
             <div class="restock-card">
-                <div class="restock-eyebrow">RESTOCK</div>
         """
     )
 
@@ -2448,12 +2447,16 @@ def render_restock_mode(conn: GSheetsConnection) -> None:
     expiry_month_value = int(expiry_display[:2]) if expiry_display else 1
     expiry_year_value = int(expiry_display[3:]) if expiry_display else 0
 
-    st.markdown(f"<div class='restock-title'>{html.escape(item_name)}</div>", unsafe_allow_html=True)
-    st.markdown(f"<div class='restock-subtitle'>{html.escape(item_description)}</div>", unsafe_allow_html=True)
+    st.markdown(
+        f"""
+        <div class="restock-eyebrow">RESTOCK</div>
+        <div class="restock-title">{html.escape(item_name)}</div>
+        <div class="restock-subtitle">{html.escape(item_description)}</div>
+        """,
+        unsafe_allow_html=True,
+    )
 
-    badge_columns = st.columns(2)
-    badge_columns[0].badge(f"ID: {item_id}", color="blue", width="stretch")
-    badge_columns[1].badge(
+    st.badge(
         f"Current stock: {current_stock}",
         color="green" if current_stock > 0 else "red",
         width="stretch",
