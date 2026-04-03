@@ -2373,7 +2373,7 @@ def render_restock_mode(conn: GSheetsConnection) -> None:
         .restock-shell {
             max-width: 32rem;
             margin: 0 auto;
-            padding: 0 0 1.5rem;
+            padding: 0.18rem 0 1.5rem;
         }
         .restock-card {
             padding: 0 0.15rem 1rem;
@@ -2392,7 +2392,7 @@ def render_restock_mode(conn: GSheetsConnection) -> None:
             font-weight: 800;
             letter-spacing: 0.02em;
             text-transform: uppercase;
-            margin-bottom: 0.1rem;
+            margin-bottom: 0.28rem;
         }
         .restock-title {
             color: #0c1722;
@@ -2400,7 +2400,7 @@ def render_restock_mode(conn: GSheetsConnection) -> None:
             font-weight: 900;
             line-height: 1.02;
             letter-spacing: -0.04em;
-            margin: 0 0 0.12rem;
+            margin: 0 0 0.18rem;
         }
         .restock-subtitle {
             color: #6b7280;
