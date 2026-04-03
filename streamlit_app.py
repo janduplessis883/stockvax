@@ -1342,7 +1342,7 @@ def render_stock_usage_plot(
                 sort=plot_df["brand_name"].tolist(),
                 axis=alt.Axis(
                     title=None,
-                    labelAngle=-90,
+                    labelAngle=-45,
                     labelColor=tick_color,
                     labelFontSize=11,
                     labelPadding=10,
@@ -1429,6 +1429,7 @@ def render_inventory_activity_plot(
             title=None,
             axis=alt.Axis(
                 format="%d %b",
+                labelAngle=-45,
                 labelColor=tick_color,
                 labelFontSize=11,
                 grid=False,
