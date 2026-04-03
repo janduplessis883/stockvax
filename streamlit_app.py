@@ -5,6 +5,7 @@ import html
 from pathlib import Path
 import re
 from typing import Callable
+from urllib.parse import quote
 
 import altair as alt
 from gspread import WorksheetNotFound
@@ -32,6 +33,7 @@ LOG_WORKSHEET_NAME = "log"
 CONSUMABLES_WORKSHEET_NAME = "consumables"
 CONSUMABLES_LOG_WORKSHEET_NAME = "consumables_log"
 APP_TIMEZONE = "Europe/London"
+RESTOCK_BASE_URL = "https://stockvax-stanhope.streamlit.app"
 VACCINE_CATEGORY_COLUMN = "category"
 VACCINE_CATEGORY = "vaccine"
 EMERGENCY_DRUG_CATEGORY = "emergency_drug"
@@ -394,6 +396,16 @@ def restock_inventory_item(conn: GSheetsConnection, item_id: str, amount: int) -
         data=prepare_inventory_sheet_data(latest_df, generic_column_name=generic_column_name),
     )
     return item_label, int(latest_df.at[row_index, "stock_level"])
+
+
+def restock_url_for_item(item_id: str) -> str:
+    encoded_item_id = quote(item_id.strip().upper(), safe="")
+    return f"{RESTOCK_BASE_URL}/?mode=restock&item_id={encoded_item_id}"
+
+
+def qr_image_url_for_item(item_id: str) -> str:
+    encoded_url = quote(restock_url_for_item(item_id), safe="")
+    return f"https://api.qrserver.com/v1/create-qr-code/?size=450x450&margin=20&data={encoded_url}"
 
 
 def select_live_worksheet(conn: GSheetsConnection, worksheet_name: str | None) -> Worksheet:
@@ -2058,11 +2070,13 @@ def render_delivery_section(
     *,
     section_title: str,
     input_key_prefix: str,
-) -> None:
+) -> tuple[str, str, str] | None:
     st.markdown(f"## {section_title}")
     if display_df.empty:
         st.info(f"No {section_title.lower()} are available in the stock list yet.")
-        return
+        return None
+
+    qr_request: tuple[str, str, str] | None = None
 
     for _, row in display_df.iterrows():
         brand_name = row["brand_name"] or row["generic_name"] or "Unnamed item"
@@ -2070,7 +2084,7 @@ def render_delivery_section(
         item_id = row["id"]
         expiry_display = format_expiry_display(row["expiry_date"]) or "Not set"
 
-        info_column, stock_column, input_column = st.columns([2.3, 1, 1.1])
+        info_column, stock_column, input_column, qr_column = st.columns([2.15, 1, 1.05, 0.8])
         with info_column:
             st.markdown(
                 f"""
@@ -2098,6 +2112,17 @@ def render_delivery_section(
                 placeholder="0",
                 width="stretch",
             )
+        with qr_column:
+            qr_clicked = st.form_submit_button(
+                "QR",
+                key=f"{input_key_prefix}_{item_id}_qr",
+                icon=":material/qr_code_2:",
+                width="stretch",
+            )
+            if qr_clicked:
+                qr_request = (item_id, brand_name, section_title)
+
+    return qr_request
 
 
 def render_delivery_tab(conn: GSheetsConnection, vaccine_df: pd.DataFrame, consumables_df: pd.DataFrame) -> None:
@@ -2161,17 +2186,18 @@ def render_delivery_tab(conn: GSheetsConnection, vaccine_df: pd.DataFrame, consu
     )
 
     with st.form("record_delivery_form", clear_on_submit=True, width="stretch"):
-        render_delivery_section(
+        qr_request = render_delivery_section(
             vaccine_display_df,
             section_title="Vaccines",
             input_key_prefix="delivery_vaccine",
         )
         st.divider()
-        render_delivery_section(
+        consumables_qr_request = render_delivery_section(
             consumables_display_df,
             section_title="Consumables",
             input_key_prefix="delivery_consumable",
         )
+        qr_request = consumables_qr_request or qr_request
 
         submitted = st.form_submit_button(
             "Record delivery",
@@ -2179,6 +2205,11 @@ def render_delivery_tab(conn: GSheetsConnection, vaccine_df: pd.DataFrame, consu
             icon=":material/local_shipping:",
             width="stretch",
         )
+
+    if qr_request is not None:
+        item_id, item_name, section_title = qr_request
+        show_item_qr_dialog(item_id, item_name, section_title)
+        return
 
     if submitted:
         vaccine_deliveries = {
@@ -2425,6 +2456,17 @@ def render_restock_mode(conn: GSheetsConnection) -> None:
             st.error(f"Could not update `{item_id}`: {exc}")
 
     st.html("</div></div>")
+
+
+@st.dialog("Item QR Code", width="large")
+def show_item_qr_dialog(item_id: str, item_name: str, section_title: str) -> None:
+    qr_url = qr_image_url_for_item(item_id)
+    restock_url = restock_url_for_item(item_id)
+    st.badge(f"{section_title}: {item_id}", color="blue", width="stretch")
+    st.markdown(f"### {item_name}")
+    st.image(qr_url, width=320)
+    st.caption("Scan this code to open the mobile restock page for this item.")
+    st.code(restock_url, language=None)
 
 
 def render_app() -> None:
