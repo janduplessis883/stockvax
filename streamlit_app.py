@@ -350,6 +350,10 @@ def is_restock_mode() -> bool:
     return query_param_value("mode").casefold() == "restock"
 
 
+def is_consume_mode() -> bool:
+    return query_param_value("mode").casefold() == "consume"
+
+
 def inventory_config_for_item_id(
     item_id: str,
 ) -> tuple[str | None, Callable[[pd.DataFrame | None], pd.DataFrame], str, str]:
@@ -405,14 +409,114 @@ def restock_inventory_item(
     return item_label, int(latest_df.at[row_index, "stock_level"]), format_expiry_display(latest_df.at[row_index, "expiry_date"])
 
 
-def restock_url_for_item(item_id: str) -> str:
+def consume_inventory_item(conn: GSheetsConnection, item_id: str, amount: int) -> tuple[str, int]:
+    latest_df, row, worksheet_name, _, generic_column_name, item_label = fetch_inventory_item(conn, item_id)
+    row_index = row.name
+    current_stock = int(latest_df.at[row_index, "stock_level"])
+    if amount <= 0:
+        raise ValueError("Amount used must be greater than zero.")
+    if amount > current_stock:
+        raise ValueError("Amount used cannot be more than current stock.")
+
+    latest_df.at[row_index, "stock_level"] = current_stock - int(amount)
+    conn.update(
+        worksheet=worksheet_name,
+        data=prepare_inventory_sheet_data(latest_df, generic_column_name=generic_column_name),
+    )
+
+    log_worksheet_name = CONSUMABLES_LOG_WORKSHEET_NAME if item_id.strip().upper().startswith("CON-") else LOG_WORKSHEET_NAME
+    log_worksheet = select_live_worksheet(conn, log_worksheet_name)
+    item_name = latest_df.at[row_index, "brand_name"] or latest_df.at[row_index, "generic_name"] or item_id
+    append_vaccine_log_row(
+        log_worksheet,
+        vaccine_id=item_id,
+        vaccine_name=item_name,
+        stock_left_before_click=current_stock,
+        doses_given=int(amount),
+    )
+
+    return item_label, int(latest_df.at[row_index, "stock_level"])
+
+
+def app_url_for_item(item_id: str, mode: str) -> str:
     encoded_item_id = quote(item_id.strip().upper(), safe="")
-    return f"{RESTOCK_BASE_URL}/?mode=restock&item_id={encoded_item_id}"
+    return f"{RESTOCK_BASE_URL}/?mode={quote(mode, safe='')}&item_id={encoded_item_id}"
 
 
-def qr_image_url_for_item(item_id: str) -> str:
-    encoded_url = quote(restock_url_for_item(item_id), safe="")
+def qr_image_url_for_item(item_id: str, mode: str) -> str:
+    encoded_url = quote(app_url_for_item(item_id, mode), safe="")
     return f"https://api.qrserver.com/v1/create-qr-code/?size=450x450&margin=20&data={encoded_url}"
+
+
+def render_mobile_inventory_shell_open() -> None:
+    st.html(
+        """
+        <style>
+        body {
+            margin: 0;
+        }
+        .restock-shell {
+            max-width: 32rem;
+            margin: 0 auto;
+            padding: 0.85rem 0 1.5rem;
+        }
+        .restock-card {
+            padding: 0 0.15rem 1rem;
+        }
+        .restock-eyebrow {
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            min-height: 2.9rem;
+            padding: 0.2rem 1.15rem;
+            border-radius: 999px;
+            background: rgba(219, 102, 83, 0.1);
+            border: 1px solid rgba(219, 102, 83, 0.12);
+            color: #cf4c34;
+            font-size: 1.05rem;
+            font-weight: 800;
+            letter-spacing: 0.02em;
+            text-transform: uppercase;
+            margin-bottom: 0.7rem;
+        }
+        .restock-title {
+            color: #0c1722;
+            font-size: 2rem;
+            font-weight: 900;
+            line-height: 1.02;
+            letter-spacing: -0.04em;
+            margin: 0 0 0.22rem;
+        }
+        .restock-subtitle {
+            color: #6b7280;
+            font-size: 1rem;
+            font-weight: 600;
+            line-height: 1.2;
+            margin: 0 0 0.6rem;
+        }
+        .restock-expiry-block {
+            margin: 0.15rem 0 0.9rem;
+        }
+        </style>
+        <div class="restock-shell">
+            <div class="restock-card">
+        """
+    )
+
+
+def render_mobile_inventory_shell_close() -> None:
+    st.html("</div></div>")
+
+
+def render_mobile_inventory_header(pill_text: str, item_name: str, item_description: str) -> None:
+    st.markdown(
+        f"""
+        <div class="restock-eyebrow">{html.escape(pill_text)}</div>
+        <div class="restock-title">{html.escape(item_name)}</div>
+        <div class="restock-subtitle">{html.escape(item_description)}</div>
+        """,
+        unsafe_allow_html=True,
+    )
 
 
 def select_live_worksheet(conn: GSheetsConnection, worksheet_name: str | None) -> Worksheet:
@@ -440,6 +544,7 @@ def append_vaccine_log_row(
     vaccine_id: str,
     vaccine_name: str,
     stock_left_before_click: int,
+    doses_given: int = 1,
 ) -> None:
     timestamp = pd.Timestamp.now(tz=APP_TIMEZONE).strftime("%Y-%m-%d %H:%M:%S")
     log_worksheet.append_row(
@@ -447,7 +552,7 @@ def append_vaccine_log_row(
             vaccine_id,
             vaccine_name,
             stock_left_before_click,
-            1,
+            doses_given,
             timestamp,
         ],
         value_input_option="USER_ENTERED",
@@ -2077,13 +2182,13 @@ def render_delivery_section(
     *,
     section_title: str,
     input_key_prefix: str,
-) -> tuple[str, str, str] | None:
+) -> tuple[str, str, str, str] | None:
     st.markdown(f"## {section_title}")
     if display_df.empty:
         st.info(f"No {section_title.lower()} are available in the stock list yet.")
         return None
 
-    qr_request: tuple[str, str, str] | None = None
+    qr_request: tuple[str, str, str, str] | None = None
 
     for _, row in display_df.iterrows():
         brand_name = row["brand_name"] or row["generic_name"] or "Unnamed item"
@@ -2091,7 +2196,9 @@ def render_delivery_section(
         item_id = row["id"]
         expiry_display = format_expiry_display(row["expiry_date"]) or "Not set"
 
-        info_column, stock_column, input_column, qr_column = st.columns([2.15, 1, 1.05, 0.8])
+        info_column, stock_column, input_column, restock_qr_column, consume_qr_column = st.columns(
+            [2.1, 1, 1.05, 0.95, 0.95]
+        )
         with info_column:
             st.markdown(
                 f"""
@@ -2119,15 +2226,24 @@ def render_delivery_section(
                 placeholder="0",
                 width="stretch",
             )
-        with qr_column:
-            qr_clicked = st.form_submit_button(
-                "QR",
-                key=f"{input_key_prefix}_{item_id}_qr",
+        with restock_qr_column:
+            restock_qr_clicked = st.form_submit_button(
+                "Restock QR",
+                key=f"{input_key_prefix}_{item_id}_restock_qr",
                 icon=":material/qr_code_2:",
                 width="stretch",
             )
-            if qr_clicked:
-                qr_request = (item_id, brand_name, section_title)
+            if restock_qr_clicked:
+                qr_request = (item_id, brand_name, section_title, "restock")
+        with consume_qr_column:
+            consume_qr_clicked = st.form_submit_button(
+                "Consume QR",
+                key=f"{input_key_prefix}_{item_id}_consume_qr",
+                icon=":material/qr_code_scanner:",
+                width="stretch",
+            )
+            if consume_qr_clicked:
+                qr_request = (item_id, brand_name, section_title, "consume")
 
     return qr_request
 
@@ -2214,8 +2330,8 @@ def render_delivery_tab(conn: GSheetsConnection, vaccine_df: pd.DataFrame, consu
         )
 
     if qr_request is not None:
-        item_id, item_name, section_title = qr_request
-        show_item_qr_dialog(item_id, item_name, section_title)
+        item_id, item_name, section_title, mode = qr_request
+        show_item_qr_dialog(item_id, item_name, section_title, mode)
         return
 
     if submitted:
@@ -2228,6 +2344,28 @@ def render_delivery_tab(conn: GSheetsConnection, vaccine_df: pd.DataFrame, consu
             for _, row in consumables_display_df.iterrows()
         }
         record_delivery(conn, vaccine_deliveries, consumable_deliveries)
+
+    st.divider()
+    batch_vaccine_column, batch_consumable_column = st.columns(2)
+    with batch_vaccine_column:
+        vaccine_batch_clicked = st.button(
+            "Vaccine / Emergency QR sheet",
+            type="secondary",
+            icon=":material/print:",
+            width="stretch",
+        )
+    with batch_consumable_column:
+        consumable_batch_clicked = st.button(
+            "Consumables QR sheet",
+            type="secondary",
+            icon=":material/print:",
+            width="stretch",
+        )
+
+    if vaccine_batch_clicked:
+        show_batch_qr_dialog(vaccine_display_df, "Vaccines / Emergency Rx")
+    if consumable_batch_clicked:
+        show_batch_qr_dialog(consumables_display_df, "Consumables")
 
 
 def render_editor_section(
@@ -2366,81 +2504,22 @@ def render_editor(conn: GSheetsConnection, vaccine_df: pd.DataFrame, consumables
 
 def render_restock_mode(conn: GSheetsConnection) -> None:
     item_id = query_param_value("item_id", "item-id").upper()
-
-    st.html(
-        """
-        <style>
-        body {
-            margin: 0;
-        }
-        .restock-shell {
-            max-width: 32rem;
-            margin: 0 auto;
-            padding: 0.85rem 0 1.5rem;
-        }
-        .restock-card {
-            padding: 0 0.15rem 1rem;
-        }
-        .restock-eyebrow {
-            display: inline-flex;
-            align-items: center;
-            justify-content: center;
-            min-height: 2.9rem;
-            padding: 0.2rem 1.15rem;
-            border-radius: 999px;
-            background: rgba(219, 102, 83, 0.1);
-            border: 1px solid rgba(219, 102, 83, 0.12);
-            color: #cf4c34;
-            font-size: 1.05rem;
-            font-weight: 800;
-            letter-spacing: 0.02em;
-            text-transform: uppercase;
-            margin-bottom: 0.7rem;
-        }
-        .restock-title {
-            color: #0c1722;
-            font-size: 2rem;
-            font-weight: 900;
-            line-height: 1.02;
-            letter-spacing: -0.04em;
-            margin: 0 0 0.22rem;
-        }
-        .restock-subtitle {
-            color: #6b7280;
-            font-size: 1rem;
-            font-weight: 600;
-            line-height: 1.2;
-            margin: 0 0 0.6rem;
-        }
-        .restock-row-label {
-            color: #7d8386;
-            font-size: 0.98rem;
-            font-weight: 600;
-            margin: 0.1rem 0 0.3rem;
-        }
-        .restock-expiry-block {
-            margin: 0.15rem 0 0.9rem;
-        }
-        </style>
-        <div class="restock-shell">
-            <div class="restock-card">
-        """
-    )
+    render_mobile_inventory_shell_open()
 
     if not item_id:
         st.error("No item ID was provided in the QR link.")
-        st.html("</div></div>")
+        render_mobile_inventory_shell_close()
         return
 
     try:
         latest_df, row, _, _, _, item_label = fetch_inventory_item(conn, item_id)
     except KeyError:
         st.error(f"Item `{item_id}` was not found.")
-        st.html("</div></div>")
+        render_mobile_inventory_shell_close()
         return
     except Exception as exc:
         st.error(f"Could not load `{item_id}` from Google Sheets: {exc}")
-        st.html("</div></div>")
+        render_mobile_inventory_shell_close()
         return
 
     item_name = row["brand_name"] or row["generic_name"] or item_id
@@ -2450,14 +2529,7 @@ def render_restock_mode(conn: GSheetsConnection) -> None:
     expiry_month_value = int(expiry_display[:2]) if expiry_display else 1
     expiry_year_value = int(expiry_display[3:]) if expiry_display else 0
 
-    st.markdown(
-        f"""
-        <div class="restock-eyebrow">RESTOCK</div>
-        <div class="restock-title">{html.escape(item_name)}</div>
-        <div class="restock-subtitle">{html.escape(item_description)}</div>
-        """,
-        unsafe_allow_html=True,
-    )
+    render_mobile_inventory_header("RESTOCK", item_name, item_description)
 
     st.badge(
         f"Current stock: {current_stock}",
@@ -2506,18 +2578,89 @@ def render_restock_mode(conn: GSheetsConnection) -> None:
         except Exception as exc:
             st.error(f"Could not update `{item_id}`: {exc}")
 
-    st.html("</div></div>")
+    render_mobile_inventory_shell_close()
+
+
+def render_consume_mode(conn: GSheetsConnection) -> None:
+    item_id = query_param_value("item_id", "item-id").upper()
+    render_mobile_inventory_shell_open()
+
+    if not item_id:
+        st.error("No item ID was provided in the QR link.")
+        render_mobile_inventory_shell_close()
+        return
+
+    try:
+        _, row, _, _, _, item_label = fetch_inventory_item(conn, item_id)
+    except KeyError:
+        st.error(f"Item `{item_id}` was not found.")
+        render_mobile_inventory_shell_close()
+        return
+    except Exception as exc:
+        st.error(f"Could not load `{item_id}` from Google Sheets: {exc}")
+        render_mobile_inventory_shell_close()
+        return
+
+    item_name = row["brand_name"] or row["generic_name"] or item_id
+    item_description = row["generic_name"] or item_label
+    current_stock = int(row["stock_level"])
+
+    render_mobile_inventory_header("CONSUME STOCK", item_name, item_description)
+
+    st.badge(
+        f"Current stock: {current_stock}",
+        color="green" if current_stock > 0 else "orange",
+        width="stretch",
+    )
+
+    with st.form("qr_consume_form", clear_on_submit=False, width="stretch"):
+        amount = st.number_input("Number Used", min_value=1, step=1, value=1, width="stretch")
+        submitted = st.form_submit_button("Update stock", type="primary", width="stretch")
+
+    if submitted:
+        try:
+            item_label, new_stock = consume_inventory_item(conn, item_id, int(amount))
+            st.success(f"{item_label} updated successfully. New stock level: {new_stock}.")
+        except Exception as exc:
+            st.error(f"Could not update `{item_id}`: {exc}")
+
+    render_mobile_inventory_shell_close()
 
 
 @st.dialog("Item QR Code")
-def show_item_qr_dialog(item_id: str, item_name: str, section_title: str) -> None:
-    qr_url = qr_image_url_for_item(item_id)
-    restock_url = restock_url_for_item(item_id)
+def show_item_qr_dialog(item_id: str, item_name: str, section_title: str, mode: str) -> None:
+    qr_url = qr_image_url_for_item(item_id, mode)
+    target_url = app_url_for_item(item_id, mode)
+    mode_label = "RESTOCK" if mode == "restock" else "CONSUME / USE"
     st.badge(f"{section_title}: {item_id}", color="blue")
     st.markdown(f"### {item_name}")
+    st.badge(mode_label, color="orange", width="stretch")
     st.image(qr_url, width=320)
-    st.caption("Scan this code to open the mobile restock page for this item.")
-    st.code(restock_url, language=None)
+    st.caption(f"Scan this code to open the mobile {mode_label.lower()} page for this item.")
+    st.code(target_url, language=None)
+
+
+@st.dialog("Printable QR Codes")
+def show_batch_qr_dialog(display_df: pd.DataFrame, section_title: str) -> None:
+    st.caption("Print or capture this sheet. Each item has a restock QR on the left and a consume QR on the right.")
+    if display_df.empty:
+        st.info(f"No {section_title.lower()} are available for QR printing yet.")
+        return
+
+    for _, row in display_df.iterrows():
+        item_id = str(row["id"]).strip().upper()
+        item_name = row["brand_name"] or row["generic_name"] or item_id
+        st.markdown(f"### {item_name}")
+        restock_column, consume_column = st.columns(2)
+        with restock_column:
+            st.caption("RESTOCK")
+            st.image(qr_image_url_for_item(item_id, "restock"), width=150)
+            st.caption(item_id)
+        with consume_column:
+            st.caption("CONSUME / USE")
+            st.image(qr_image_url_for_item(item_id, "consume"), width=150)
+            st.caption(item_id)
+        st.divider()
 
 
 def render_app() -> None:
@@ -2525,6 +2668,9 @@ def render_app() -> None:
 
     if is_restock_mode():
         render_restock_mode(conn)
+        return
+    if is_consume_mode():
+        render_consume_mode(conn)
         return
 
     render_title_banner()
