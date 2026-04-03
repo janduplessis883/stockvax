@@ -2376,10 +2376,7 @@ def render_restock_mode(conn: GSheetsConnection) -> None:
             padding: 0.5rem 0 1.5rem;
         }
         .restock-card {
-            background: #ffffff;
-            border: 1px solid rgba(12, 23, 34, 0.08);
-            border-radius: 24px;
-            padding: 1.15rem 1rem 1rem;
+            padding: 0.2rem 0.15rem 1rem;
         }
         .restock-eyebrow {
             display: inline-flex;
@@ -2454,30 +2451,6 @@ def render_restock_mode(conn: GSheetsConnection) -> None:
     st.markdown(f"<div class='restock-title'>{html.escape(item_name)}</div>", unsafe_allow_html=True)
     st.markdown(f"<div class='restock-subtitle'>{html.escape(item_description)}</div>", unsafe_allow_html=True)
 
-    st.markdown("<div class='restock-expiry-block'>", unsafe_allow_html=True)
-    expiry_month_column, expiry_year_column = st.columns(2)
-    with expiry_month_column:
-        expiry_month = st.number_input(
-            "MM",
-            min_value=1,
-            max_value=12,
-            value=expiry_month_value,
-            step=1,
-            format="%02d",
-            width="stretch",
-        )
-    with expiry_year_column:
-        expiry_year = st.number_input(
-            "YY",
-            min_value=0,
-            max_value=99,
-            value=expiry_year_value,
-            step=1,
-            format="%02d",
-            width="stretch",
-        )
-    st.markdown("</div>", unsafe_allow_html=True)
-
     badge_columns = st.columns(2)
     badge_columns[0].badge(f"ID: {item_id}", color="blue", width="stretch")
     badge_columns[1].badge(
@@ -2487,6 +2460,29 @@ def render_restock_mode(conn: GSheetsConnection) -> None:
     )
 
     with st.form("qr_restock_form", clear_on_submit=False, width="stretch"):
+        st.markdown("<div class='restock-expiry-block'>", unsafe_allow_html=True)
+        expiry_month_column, expiry_year_column = st.columns(2)
+        with expiry_month_column:
+            expiry_month = st.number_input(
+                "MM",
+                min_value=1,
+                max_value=12,
+                value=expiry_month_value,
+                step=1,
+                format="%02d",
+                width="stretch",
+            )
+        with expiry_year_column:
+            expiry_year = st.number_input(
+                "YY",
+                min_value=0,
+                max_value=99,
+                value=expiry_year_value,
+                step=1,
+                format="%02d",
+                width="stretch",
+            )
+        st.markdown("</div>", unsafe_allow_html=True)
         amount = st.number_input("Amount re-stocked", min_value=1, step=1, value=1, width="stretch")
         submitted = st.form_submit_button("Update stock", type="primary", width="stretch")
 
