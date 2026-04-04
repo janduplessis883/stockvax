@@ -1312,30 +1312,29 @@ def render_metrics(
 
 def watchlist_row_styles(row: pd.Series, table_kind: str) -> list[str]:
     text_color = st.get_option("theme.textColor") or "#0c1722"
-    reorder_color = "#f6e568"
-    out_of_stock_color = "#cb3f4e"
-    expiry_soon_color = "#a9b0a6"
-    expired_stock_color = "#5f676f"
+    low_stock_row_color = "#f9f6f0"
+    out_of_stock_row_color = "#faf0ee"
+    expiry_row_color = "#edefec"
 
     background = ""
     border = ""
     status = row.get("status", "")
 
     if status == "Out of stock":
-        background = hex_to_rgba(out_of_stock_color, 0.26)
-        border = f"4px solid {out_of_stock_color}"
+        background = out_of_stock_row_color
+        border = f"4px solid {out_of_stock_row_color}"
     elif status == "Expired stock":
-        background = hex_to_rgba(expired_stock_color, 0.22)
-        border = f"4px solid {expired_stock_color}"
+        background = expiry_row_color
+        border = f"4px solid {expiry_row_color}"
     elif status == "Reorder":
-        background = reorder_color
-        border = f"4px solid {reorder_color}"
+        background = low_stock_row_color
+        border = f"4px solid {low_stock_row_color}"
     elif status == "Expiring soon":
-        background = hex_to_rgba(expiry_soon_color, 0.22)
-        border = f"4px solid {expiry_soon_color}"
+        background = expiry_row_color
+        border = f"4px solid {expiry_row_color}"
     elif table_kind == "expiry" and pd.notna(row.get("days_until_expiry")) and int(row.get("days_until_expiry", 9999)) <= 90:
-        background = hex_to_rgba(expiry_soon_color, 0.18)
-        border = f"4px solid {expiry_soon_color}"
+        background = expiry_row_color
+        border = f"4px solid {expiry_row_color}"
 
     base_style = f"color: {text_color};"
     if not background:
@@ -2107,13 +2106,13 @@ def render_inventory_action_tab(
                     detail_columns[1].metric(":gray[Order level]", f":gray[{order_level}]")
 
                     if is_expired and stock_level > 0:
-                        st.badge("Vaccine / drug expired", icon=":material/gpp_bad:", color="red", width="stretch")
+                        st.error("Vaccine / drug expired", icon=":material/gpp_bad:", width="stretch")
                     elif stock_level <= 0:
-                        st.badge("Out of stock", icon=":material/error:", color="red", width="stretch")
+                        st.error("Out of stock", icon=":material/error:", width="stretch")
                     elif stock_level <= order_level and order_level > 0:
-                        st.badge("Low stock / Reorder", icon=":material/warning:", color="yellow", width="stretch")
+                        st.warning("Low stock / Reorder", icon=":material/warning:", width="stretch")
                     else:
-                        st.badge("Ready to record", icon=":material/check_circle:", color="blue", width="stretch")
+                        st.success("Ready to record", icon=":material/check_circle:", width="stretch")
 
                     if st.button(
                         button_label,
