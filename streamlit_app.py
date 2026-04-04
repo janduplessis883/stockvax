@@ -1671,7 +1671,10 @@ def render_inventory_overview(
     reorder_df = reorder_df.sort_values(["status", "suggested_order_qty", "brand_name"], ascending=[True, False, True])
 
     expiry_df = stock_df[
-        stock_df["days_until_expiry"].notna() & (stock_df["stock_level"] > 0)
+        stock_df["days_until_expiry"].notna()
+        & (stock_df["days_until_expiry"] >= 0)
+        & (stock_df["days_until_expiry"] <= 90)
+        & (stock_df["stock_level"] > 0)
     ].copy()
     expiry_df = expiry_df.sort_values("days_until_expiry")
 
@@ -1708,7 +1711,7 @@ def render_inventory_overview(
     with right_column:
         st.subheader("Expiry watchlist")
         if expiry_df.empty:
-            st.info(f"No {item_label_plural.lower()} have an expiry date recorded yet.")
+            st.info(f"No {item_label_plural.lower()} are due to expire in the next 90 days.")
         else:
             st.dataframe(
                 styled_watchlist_table(
