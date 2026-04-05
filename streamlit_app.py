@@ -259,13 +259,19 @@ def prepare_inventory_sheet_data(
 
 
 def parse_expiry_date(value: object) -> pd.Timestamp | pd.NaT:
-    expiry = normalize_expiry_text(value)
-    if not EXPIRY_PATTERN.fullmatch(expiry):
-        return pd.NaT
+    if isinstance(value, pd.Timestamp):
+        return value.normalize()
 
-    month = int(expiry[:2])
-    year = 2000 + int(expiry[2:])
-    return pd.Period(f"{year}-{month:02d}", freq="M").end_time.normalize()
+    expiry = normalize_expiry_text(value)
+    if EXPIRY_PATTERN.fullmatch(expiry):
+        month = int(expiry[:2])
+        year = 2000 + int(expiry[2:])
+        return pd.Period(f"{year}-{month:02d}", freq="M").end_time.normalize()
+
+    parsed_date = pd.to_datetime(value, errors="coerce", dayfirst=True)
+    if pd.isna(parsed_date):
+        return pd.NaT
+    return pd.Timestamp(parsed_date).normalize()
 
 
 def format_expiry_display(value: object) -> str:
@@ -1655,6 +1661,7 @@ def render_inventory_overview(
     log_df: pd.DataFrame,
     *,
     section_title: str,
+    expired_heading_label: str,
     tracked_label: str,
     on_hand_label: str,
     item_label_plural: str,
@@ -1669,6 +1676,13 @@ def render_inventory_overview(
 
     reorder_df = stock_df[stock_df["status"].isin(["Reorder", "Out of stock"])].copy()
     reorder_df = reorder_df.sort_values(["status", "suggested_order_qty", "brand_name"], ascending=[True, False, True])
+
+    expired_df = stock_df[
+        stock_df["days_until_expiry"].notna()
+        & (stock_df["days_until_expiry"] < 0)
+        & (stock_df["stock_level"] > 0)
+    ].copy()
+    expired_df = expired_df.sort_values("days_until_expiry")
 
     expiry_df = stock_df[
         stock_df["days_until_expiry"].notna()
@@ -1709,6 +1723,28 @@ def render_inventory_overview(
             )
 
     with right_column:
+        st.markdown(f"### :orange[Expired {expired_heading_label}]")
+        if expired_df.empty:
+            st.info(f"No expired {item_label_plural.lower()} with stock on hand were found.")
+        else:
+            st.dataframe(
+                styled_watchlist_table(
+                    expired_df[
+                        [
+                            "brand_name",
+                            "generic_name",
+                            "expiry_date",
+                            "days_until_expiry",
+                            "stock_level",
+                            "status",
+                        ]
+                    ],
+                    "expiry",
+                ),
+                width="stretch",
+                hide_index=True,
+            )
+
         st.subheader("Expiry watchlist")
         if expiry_df.empty:
             st.info(f"No {item_label_plural.lower()} are due to expire in the next 90 days.")
@@ -2984,65 +3020,83 @@ def render_app() -> None:
     if "active_section" not in st.session_state:
         st.session_state["active_section"] = navigation_options[0]
 
-    active_section = st.radio(
-        "Section",
-        options=navigation_options,
+    (
+        vaccine_tab,
+        consumables_tab,
+        vaccine_overview_tab,
+        consumables_overview_tab,
+        delivery_tab,
+        editor_tab,
+    ) = st.tabs(
+        navigation_options,
         key="active_section",
-        horizontal=True,
-        label_visibility="collapsed",
-    )
-    st.html(
-        """
-        <style>
-        div[role="radiogroup"] label p {
-            font-weight: 800;
-        }
-        </style>
-        """
+        on_change="rerun",
     )
 
-    if active_section == "VACCINE | EMERGENCY Rx":
-        render_nurse_tab(conn, raw_stock, vaccine_log_df)
+    with vaccine_tab:
+        if vaccine_tab.open:
+            render_nurse_tab(conn, raw_stock, vaccine_log_df)
 
-    elif active_section == "CONSUMABLES":
-        render_consumables_tab(conn, raw_consumables, consumables_log_df)
+    with consumables_tab:
+        if consumables_tab.open:
+            render_consumables_tab(conn, raw_consumables, consumables_log_df)
 
-    elif active_section == "Vaccine | Emergency Rx overview":
-        render_inventory_overview(
-            stock_with_metrics,
-            vaccine_log_df,
-            section_title="Vaccines",
-            tracked_label="Vaccines tracked",
-            on_hand_label="Doses on hand",
-            item_label_plural="Vaccines",
-            value_label="Doses",
-            activity_value_label="Vaccines given",
-            log_worksheet_name=LOG_WORKSHEET_NAME,
-            stock_chart_colors=VACCINE_STOCK_COLORS,
-            activity_chart_colors=VACCINE_ACTIVITY_COLORS,
-            split_vaccine_categories=True,
-        )
+    with vaccine_overview_tab:
+        if vaccine_overview_tab.open:
+            vaccine_overview_df = stock_with_metrics
+            live_vaccine_snapshot = fetch_snapshot(conn, selected_worksheet_name())
+            if live_vaccine_snapshot.source_kind in {"google", "info", "sample"}:
+                vaccine_overview_df = add_inventory_metrics(
+                    live_vaccine_snapshot.data,
+                    cleaner=clean_stock_data,
+                )
+            render_inventory_overview(
+                vaccine_overview_df,
+                vaccine_log_df,
+                section_title="Vaccines",
+                expired_heading_label="Vaccines / Emergency drugs",
+                tracked_label="Vaccines tracked",
+                on_hand_label="Doses on hand",
+                item_label_plural="Vaccines",
+                value_label="Doses",
+                activity_value_label="Vaccines given",
+                log_worksheet_name=LOG_WORKSHEET_NAME,
+                stock_chart_colors=VACCINE_STOCK_COLORS,
+                activity_chart_colors=VACCINE_ACTIVITY_COLORS,
+                split_vaccine_categories=True,
+            )
 
-    elif active_section == "Consumables overview":
-        render_inventory_overview(
-            consumables_with_metrics,
-            consumables_log_df,
-            section_title="Consumables",
-            tracked_label="Consumables tracked",
-            on_hand_label="Items on hand",
-            item_label_plural="Consumables",
-            value_label="Items",
-            activity_value_label="Consumables used",
-            log_worksheet_name=CONSUMABLES_LOG_WORKSHEET_NAME,
-            stock_chart_colors=CONSUMABLE_STOCK_COLORS,
-            activity_chart_colors=CONSUMABLE_ACTIVITY_COLORS,
-        )
+    with consumables_overview_tab:
+        if consumables_overview_tab.open:
+            consumables_overview_df = consumables_with_metrics
+            live_consumables_snapshot = fetch_consumables_snapshot(conn)
+            if live_consumables_snapshot.source_kind in {"google", "info"}:
+                consumables_overview_df = add_inventory_metrics(
+                    live_consumables_snapshot.data,
+                    cleaner=clean_consumables_data,
+                )
+            render_inventory_overview(
+                consumables_overview_df,
+                consumables_log_df,
+                section_title="Consumables",
+                expired_heading_label="Consumables",
+                tracked_label="Consumables tracked",
+                on_hand_label="Items on hand",
+                item_label_plural="Consumables",
+                value_label="Items",
+                activity_value_label="Consumables used",
+                log_worksheet_name=CONSUMABLES_LOG_WORKSHEET_NAME,
+                stock_chart_colors=CONSUMABLE_STOCK_COLORS,
+                activity_chart_colors=CONSUMABLE_ACTIVITY_COLORS,
+            )
 
-    elif active_section == "Record delivery":
-        render_delivery_tab(conn, raw_stock, raw_consumables)
+    with delivery_tab:
+        if delivery_tab.open:
+            render_delivery_tab(conn, raw_stock, raw_consumables)
 
-    elif active_section == "Stock editor":
-        render_editor(conn, raw_stock, raw_consumables)
+    with editor_tab:
+        if editor_tab.open:
+            render_editor(conn, raw_stock, raw_consumables)
 
     show_toast_message()
 

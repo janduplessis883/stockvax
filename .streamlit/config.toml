@@ -20,7 +20,7 @@ headingFontWeights = [900, 900, 900, 900, 900, 900]
 chartCategoricalColors = ["#0c1722", "#ec5d4b", "#459bce", "#fae44c", "#ea39af", "#ea3c34", "#f3f8f3", "#5d6770", "#8fa6b1"]
 
 redColor = "#db6653"
-orangeColor = "#cba165"
+orangeColor = "#db6653"
 yellowColor = "#cba165"
 greenColor = "#436544"
 blueColor = "#777f75"
