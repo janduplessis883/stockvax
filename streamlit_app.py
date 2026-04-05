@@ -1816,6 +1816,12 @@ def render_inventory_overview(
         hide_index=True,
     )
 
+    with st.expander(f"View `{log_worksheet_name}` log data", icon=":material/table_view:"):
+        if log_df.empty:
+            st.info(f"No rows are available in `{log_worksheet_name}` yet.")
+        else:
+            st.dataframe(log_df, width="stretch", hide_index=True)
+
 
 def record_inventory_click(
     conn: GSheetsConnection,
