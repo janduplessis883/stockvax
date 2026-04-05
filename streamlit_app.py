@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 from dataclasses import dataclass
 import html
 from pathlib import Path
@@ -17,6 +18,7 @@ from streamlit_gsheets import GSheetsConnection
 
 
 SAMPLE_DATA_PATH = Path(__file__).parent / "data" / "stockvax_sample.csv"
+LOGO_PATH = Path(__file__).parent / "data" / "logo.png"
 BASE_COLUMNS = [
     "id",
     "brand_name",
@@ -51,8 +53,14 @@ class StockSnapshot:
     message: str
 
 
+@st.cache_data(show_spinner=False)
+def load_logo_data_uri() -> str:
+    encoded_logo = base64.b64encode(LOGO_PATH.read_bytes()).decode("ascii")
+    return f"data:image/png;base64,{encoded_logo}"
+
+
 st.set_page_config(page_title="StockVax", layout="wide")
-st.logo("data/logo.png", size="large")
+st.logo(load_logo_data_uri(), size="large")
 
 def normalize_column_name(name: str) -> str:
     normalized = re.sub(r"[^0-9a-zA-Z]+", "_", str(name).strip().lower())
@@ -666,10 +674,32 @@ def load_inventory_log_data(conn: GSheetsConnection, log_worksheet_name: str) ->
 
     trimmed["stock_before"] = pd.to_numeric(trimmed["stock_before"], errors="coerce")
     trimmed["doses_given"] = pd.to_numeric(trimmed["doses_given"], errors="coerce").fillna(1)
-    trimmed["timestamp"] = pd.to_datetime(trimmed["timestamp"], errors="coerce")
+    trimmed["timestamp"] = trimmed["timestamp"].map(parse_log_timestamp)
     trimmed = trimmed[trimmed["timestamp"].notna()].copy()
 
     return trimmed.reset_index(drop=True)
+
+
+def parse_log_timestamp(value: object) -> pd.Timestamp | pd.NaT:
+    text = str(value).strip()
+    if not text or text.lower() in {"nan", "none"}:
+        return pd.NaT
+
+    common_formats = (
+        "%Y-%m-%d %H:%M:%S",
+        "%Y-%m-%d %H:%M",
+        "%d/%m/%Y %H:%M:%S",
+        "%d/%m/%Y %H:%M",
+    )
+    for timestamp_format in common_formats:
+        parsed = pd.to_datetime(text, format=timestamp_format, errors="coerce")
+        if pd.notna(parsed):
+            return pd.Timestamp(parsed)
+
+    parsed = pd.to_datetime(text, errors="coerce", dayfirst=True)
+    if pd.isna(parsed):
+        return pd.NaT
+    return pd.Timestamp(parsed)
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
@@ -1723,7 +1753,7 @@ def render_inventory_overview(
             )
 
     with right_column:
-        st.markdown(f"### :orange[Expired {expired_heading_label}]")
+        st.markdown(f"### Expired {expired_heading_label}")
         if expired_df.empty:
             st.info(f"No expired {item_label_plural.lower()} with stock on hand were found.")
         else:
@@ -2094,8 +2124,9 @@ def render_inventory_action_tab(
             st.info(empty_message)
         return
 
-    def render_card_group(group_df: pd.DataFrame, *, title: str, empty_group_message: str) -> None:
-        st.markdown(f"### {title}")
+    def render_card_group(group_df: pd.DataFrame, *, title: str | None, empty_group_message: str) -> None:
+        if title:
+            st.markdown(f"### {title}")
         if group_df.empty:
             st.info(empty_group_message)
             return
@@ -2186,7 +2217,7 @@ def render_inventory_action_tab(
             render_card_group(group_df, title=title, empty_group_message=empty_group_message)
         return
 
-    render_card_group(display_df, title=section_subheader, empty_group_message=empty_message)
+    render_card_group(display_df, title=None, empty_group_message=empty_message)
 
 
 def render_nurse_tab(conn: GSheetsConnection, stock_df: pd.DataFrame, log_df: pd.DataFrame) -> None:
@@ -2196,7 +2227,7 @@ def render_nurse_tab(conn: GSheetsConnection, stock_df: pd.DataFrame, log_df: pd
         conn=conn,
         cleaner=clean_stock_data,
         expander_title="Vaccine and emergency drug stock usage bar plot",
-        section_subheader="Nurse recording",
+        section_subheader="Vaccine & Emergency drug recording",
         chart_item_label="Stock item",
         caption="Keep this tab open during clinic. One click records one vaccine or emergency drug given and updates the live stock level immediately.",
         empty_message="No vaccines are available in the stock list yet.",
@@ -2216,7 +2247,7 @@ def render_consumables_tab(conn: GSheetsConnection, stock_df: pd.DataFrame, log_
         conn=conn,
         cleaner=clean_consumables_data,
         expander_title="Consumables stock usage bar plot",
-        section_subheader="Consumables recording",
+        section_subheader=":material/clean_hands: Consumables recording",
         chart_item_label="Consumable",
         caption="Use this tab to record one consumable used and update the live stock level immediately.",
         empty_message="No consumables are available in the stock list yet.",
@@ -2414,7 +2445,7 @@ def render_delivery_section(
 
 
 def render_delivery_tab(conn: GSheetsConnection, vaccine_df: pd.DataFrame, consumables_df: pd.DataFrame) -> None:
-    st.subheader("Record delivery")
+    st.subheader(":material/local_shipping: Record delivery")
     st.caption("Enter any new stock delivered today for vaccines or consumables, then save once to add the quantities onto the live stock levels.")
 
     vaccine_category_series = vaccine_df.apply(resolve_stock_category, axis=1)
@@ -2486,20 +2517,20 @@ def render_delivery_tab(conn: GSheetsConnection, vaccine_df: pd.DataFrame, consu
     with st.form("record_delivery_form", clear_on_submit=True, width="stretch"):
         qr_request = render_delivery_section(
             vaccine_display_df,
-            section_title="Vaccines",
+            section_title=":material/syringe: Vaccines",
             input_key_prefix="delivery_vaccine",
         )
         st.divider()
         emergency_qr_request = render_delivery_section(
             emergency_display_df,
-            section_title="Emergency drugs",
+            section_title=":material/ecg_heart: Emergency drugs",
             input_key_prefix="delivery_emergency",
         )
         qr_request = emergency_qr_request or qr_request
         st.divider()
         consumables_qr_request = render_delivery_section(
             consumables_display_df,
-            section_title="Consumables",
+            section_title=":material/clean_hands: Consumables",
             input_key_prefix="delivery_consumable",
         )
         qr_request = consumables_qr_request or qr_request
@@ -2535,14 +2566,14 @@ def render_delivery_tab(conn: GSheetsConnection, vaccine_df: pd.DataFrame, consu
     batch_vaccine_column, batch_consumable_column = st.columns(2)
     with batch_vaccine_column:
         vaccine_batch_clicked = st.button(
-            "Vaccine / Emergency QR sheet",
+            ":material/syringe: Vaccine / :material/ecg_heart: Emergency QR sheet",
             type="secondary",
             icon=":material/print:",
             width="stretch",
         )
     with batch_consumable_column:
         consumable_batch_clicked = st.button(
-            "Consumables QR sheet",
+            ":material/clean_hands: Consumables QR sheet",
             type="secondary",
             icon=":material/print:",
             width="stretch",
@@ -2558,10 +2589,10 @@ def render_delivery_tab(conn: GSheetsConnection, vaccine_df: pd.DataFrame, consu
     selected_sheet = st.session_state.get("delivery_qr_sheet")
     if selected_sheet == "vaccines":
         st.divider()
-        render_batch_qr_sheet(vaccine_display_df, "Vaccines / Emergency Rx")
+        render_batch_qr_sheet(vaccine_display_df, ":material/syringe: Vaccines / :material/ecg_heart: Emergency Rx")
     elif selected_sheet == "consumables":
         st.divider()
-        render_batch_qr_sheet(consumables_display_df, "Consumables")
+        render_batch_qr_sheet(consumables_display_df, ":material/clean_hands: Consumables")
 
 
 def render_editor_section(
@@ -2693,7 +2724,7 @@ def render_editor(conn: GSheetsConnection, vaccine_df: pd.DataFrame, consumables
     render_editor_section(
         conn,
         vaccine_only_df,
-        section_title="Vaccines",
+        section_title=":material/syringe: Vaccines",
         worksheet_name=selected_worksheet_name(),
         cleaner=clean_stock_data,
         snapshot_applier=apply_snapshot,
@@ -2709,7 +2740,7 @@ def render_editor(conn: GSheetsConnection, vaccine_df: pd.DataFrame, consumables
     render_editor_section(
         conn,
         emergency_drug_df,
-        section_title="Emergency drugs",
+        section_title=":material/ecg_heart: Emergency drugs",
         worksheet_name=selected_worksheet_name(),
         cleaner=clean_stock_data,
         snapshot_applier=apply_snapshot,
@@ -2725,7 +2756,7 @@ def render_editor(conn: GSheetsConnection, vaccine_df: pd.DataFrame, consumables
     render_editor_section(
         conn,
         consumables_df,
-        section_title="Consumables",
+        section_title=":material/clean_hands: Consumables",
         worksheet_name=CONSUMABLES_WORKSHEET_NAME,
         cleaner=clean_consumables_data,
         snapshot_applier=apply_consumables_snapshot,
