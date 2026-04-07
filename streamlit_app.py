@@ -2563,10 +2563,17 @@ def render_delivery_tab(conn: GSheetsConnection, vaccine_df: pd.DataFrame, consu
         record_delivery(conn, {**vaccine_deliveries, **emergency_deliveries}, consumable_deliveries)
 
     st.divider()
-    batch_vaccine_column, batch_consumable_column = st.columns(2)
+    batch_vaccine_column, batch_emergency_column, batch_consumable_column = st.columns(3)
     with batch_vaccine_column:
         vaccine_batch_clicked = st.button(
-            ":material/syringe: Vaccine / :material/ecg_heart: Emergency QR sheet",
+            ":material/syringe: Vaccines QR sheet",
+            type="secondary",
+            icon=":material/print:",
+            width="stretch",
+        )
+    with batch_emergency_column:
+        emergency_batch_clicked = st.button(
+            ":material/ecg_heart: Emergency QR sheet",
             type="secondary",
             icon=":material/print:",
             width="stretch",
@@ -2582,6 +2589,9 @@ def render_delivery_tab(conn: GSheetsConnection, vaccine_df: pd.DataFrame, consu
     if vaccine_batch_clicked:
         current_sheet = st.session_state.get("delivery_qr_sheet")
         st.session_state["delivery_qr_sheet"] = None if current_sheet == "vaccines" else "vaccines"
+    if emergency_batch_clicked:
+        current_sheet = st.session_state.get("delivery_qr_sheet")
+        st.session_state["delivery_qr_sheet"] = None if current_sheet == "emergency" else "emergency"
     if consumable_batch_clicked:
         current_sheet = st.session_state.get("delivery_qr_sheet")
         st.session_state["delivery_qr_sheet"] = None if current_sheet == "consumables" else "consumables"
@@ -2589,7 +2599,10 @@ def render_delivery_tab(conn: GSheetsConnection, vaccine_df: pd.DataFrame, consu
     selected_sheet = st.session_state.get("delivery_qr_sheet")
     if selected_sheet == "vaccines":
         st.divider()
-        render_batch_qr_sheet(vaccine_display_df, ":material/syringe: Vaccines / :material/ecg_heart: Emergency Rx")
+        render_batch_qr_sheet(vaccine_display_df, ":material/syringe: Vaccines")
+    elif selected_sheet == "emergency":
+        st.divider()
+        render_batch_qr_sheet(emergency_display_df, ":material/ecg_heart: Emergency drugs")
     elif selected_sheet == "consumables":
         st.divider()
         render_batch_qr_sheet(consumables_display_df, ":material/clean_hands: Consumables")
