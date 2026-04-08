@@ -44,6 +44,9 @@ VACCINE_STOCK_COLORS = ("#ec5d4b", "#0c1722")
 CONSUMABLE_STOCK_COLORS = ("#74a8d1", "#0e1721")
 VACCINE_ACTIVITY_COLORS = ("#ec5d4b", "#f3a43b")
 CONSUMABLE_ACTIVITY_COLORS = ("#c853a6", "#c853a6")
+EXPIRY_MONTH_COLUMN = "expiry_month"
+EXPIRY_YEAR_COLUMN = "expiry_year"
+EXPIRY_MONTH_OPTIONS = [f"{month:02d}" for month in range(1, 13)]
 
 
 @dataclass
@@ -287,6 +290,52 @@ def format_expiry_display(value: object) -> str:
     if not EXPIRY_PATTERN.fullmatch(expiry):
         return ""
     return f"{expiry[:2]}/{expiry[2:]}"
+
+
+def split_expiry_parts(value: object) -> tuple[str, str]:
+    expiry = normalize_expiry_text(value)
+    if not EXPIRY_PATTERN.fullmatch(expiry):
+        return "", ""
+    return expiry[:2], expiry[2:]
+
+
+def available_expiry_year_options(values: pd.Series | list[object] | None = None) -> list[str]:
+    current_year = pd.Timestamp.today().year
+    year_options = {f"{year % 100:02d}" for year in range(current_year - 2, current_year + 16)}
+
+    if values is not None:
+        for value in values:
+            _, year = split_expiry_parts(value)
+            if year:
+                year_options.add(year)
+
+    return sorted(year_options, key=int)
+
+
+def add_expiry_editor_columns(df: pd.DataFrame) -> pd.DataFrame:
+    editor_df = df.copy()
+    expiry_parts = editor_df["expiry_date"].map(split_expiry_parts)
+    editor_df[EXPIRY_MONTH_COLUMN] = expiry_parts.map(lambda parts: parts[0])
+    editor_df[EXPIRY_YEAR_COLUMN] = expiry_parts.map(lambda parts: parts[1])
+    return editor_df.drop(columns=["expiry_date"], errors="ignore")
+
+
+def combine_expiry_editor_columns(df: pd.DataFrame) -> tuple[pd.DataFrame, str | None]:
+    editor_df = df.copy()
+    month_series = editor_df.get(EXPIRY_MONTH_COLUMN, "").fillna("").astype(str).str.strip()
+    year_series = editor_df.get(EXPIRY_YEAR_COLUMN, "").fillna("").astype(str).str.strip()
+
+    partial_mask = (month_series == "") ^ (year_series == "")
+    if partial_mask.any():
+        row_number = int(partial_mask[partial_mask].index[0]) + 1
+        return editor_df, f"Expiry month and year must both be selected, or both left blank. Check row {row_number}."
+
+    editor_df["expiry_date"] = [
+        f"{month}{year}" if month and year else ""
+        for month, year in zip(month_series, year_series)
+    ]
+    editor_df = editor_df.drop(columns=[EXPIRY_MONTH_COLUMN, EXPIRY_YEAR_COLUMN], errors="ignore")
+    return editor_df, None
 
 
 def status_for_row(row: pd.Series) -> str:
@@ -2625,10 +2674,20 @@ def render_editor_section(
     default_category: str | None = None,
 ) -> None:
     st.markdown(f"## {section_title}")
-    editor_columns = BASE_COLUMNS + [column for column in stock_df.columns if column not in BASE_COLUMNS]
-    editable_df = stock_df[editor_columns].copy()
+    raw_editor_columns = BASE_COLUMNS + [column for column in stock_df.columns if column not in BASE_COLUMNS]
+    editable_columns: list[str] = []
+    for column in raw_editor_columns:
+        if column == "expiry_date":
+            editable_columns.extend([EXPIRY_MONTH_COLUMN, EXPIRY_YEAR_COLUMN])
+        else:
+            editable_columns.append(column)
+
+    editable_df = add_expiry_editor_columns(stock_df[raw_editor_columns].copy())
+    editable_df = editable_df[editable_columns]
     if default_category and VACCINE_CATEGORY_COLUMN in editable_df.columns:
         editable_df[VACCINE_CATEGORY_COLUMN] = editable_df[VACCINE_CATEGORY_COLUMN].replace("", pd.NA).fillna(default_category)
+
+    expiry_year_options = [""] + available_expiry_year_options(stock_df["expiry_date"].tolist())
 
     edited_df = st.data_editor(
         editable_df,
@@ -2641,7 +2700,16 @@ def render_editor_section(
             "id": st.column_config.TextColumn("ID"),
             "brand_name": st.column_config.TextColumn("Brand name", required=True),
             "generic_name": st.column_config.TextColumn(generic_name_label, required=True),
-            "expiry_date": st.column_config.TextColumn("Expiry (MMYY)"),
+            EXPIRY_MONTH_COLUMN: st.column_config.SelectboxColumn(
+                "Expiry month",
+                options=[""] + EXPIRY_MONTH_OPTIONS,
+                required=False,
+            ),
+            EXPIRY_YEAR_COLUMN: st.column_config.SelectboxColumn(
+                "Expiry year",
+                options=expiry_year_options,
+                required=False,
+            ),
             "stock_level": st.column_config.NumberColumn("Stock level", min_value=0, step=1, format="%d"),
             "expected_monthly_use": st.column_config.NumberColumn(
                 "Expected monthly use",
@@ -2664,11 +2732,14 @@ def render_editor_section(
             editor_output_df[VACCINE_CATEGORY_COLUMN].replace("", pd.NA).fillna(default_category)
         )
 
-    cleaned_edited_df = cleaner(editor_output_df)
+    combined_editor_df, expiry_error = combine_expiry_editor_columns(editor_output_df)
+    cleaned_edited_df = cleaner(combined_editor_df)
     changes_pending = not frames_match(cleaned_edited_df, cleaner(stock_df))
 
     if changes_pending:
         st.info(f"You have unsaved changes in the {section_title.lower()} editor.")
+    if expiry_error:
+        st.warning(expiry_error)
 
     button_columns = st.columns([1, 1, 1.2])
     save_clicked = button_columns[0].button(save_button_label, type="primary", width="stretch", key=f"{editor_key}_save")
@@ -2683,6 +2754,9 @@ def render_editor_section(
     )
 
     if save_clicked:
+        if expiry_error:
+            st.error(expiry_error)
+            return
         try:
             data_to_save = cleaned_edited_df
             if full_stock_df is not None:
@@ -2804,9 +2878,9 @@ def render_restock_mode(conn: GSheetsConnection) -> None:
     item_name = row["brand_name"] or row["generic_name"] or item_id
     item_description = row["generic_name"] or item_label
     current_stock = int(row["stock_level"])
-    expiry_display = format_expiry_display(row["expiry_date"])
-    expiry_month_value = int(expiry_display[:2]) if expiry_display else 1
-    expiry_year_value = int(expiry_display[3:]) if expiry_display else 0
+    expiry_month_value, expiry_year_value = split_expiry_parts(row["expiry_date"])
+    restock_year_options = available_expiry_year_options([row["expiry_date"]])
+    default_restock_year = expiry_year_value or f"{pd.Timestamp.today().year % 100:02d}"
 
     render_mobile_inventory_header("RESTOCK", item_name, item_description)
 
@@ -2820,23 +2894,17 @@ def render_restock_mode(conn: GSheetsConnection) -> None:
         st.markdown("<div class='restock-expiry-block'>", unsafe_allow_html=True)
         expiry_month_column, expiry_year_column = st.columns(2)
         with expiry_month_column:
-            expiry_month = st.number_input(
-                "Expiry Month (MM)",
-                min_value=1,
-                max_value=12,
-                value=expiry_month_value,
-                step=1,
-                format="%02d",
+            expiry_month = st.selectbox(
+                "Expiry Month",
+                options=EXPIRY_MONTH_OPTIONS,
+                index=EXPIRY_MONTH_OPTIONS.index(expiry_month_value) if expiry_month_value in EXPIRY_MONTH_OPTIONS else 0,
                 width="stretch",
             )
         with expiry_year_column:
-            expiry_year = st.number_input(
-                "Expiry Year (YY)",
-                min_value=0,
-                max_value=99,
-                value=expiry_year_value,
-                step=1,
-                format="%02d",
+            expiry_year = st.selectbox(
+                "Expiry Year",
+                options=restock_year_options,
+                index=restock_year_options.index(default_restock_year) if default_restock_year in restock_year_options else 0,
                 width="stretch",
             )
         st.markdown("</div>", unsafe_allow_html=True)
@@ -2844,7 +2912,7 @@ def render_restock_mode(conn: GSheetsConnection) -> None:
         submitted = st.form_submit_button("Update stock", type="primary", width="stretch")
 
     if submitted:
-        updated_expiry = f"{int(expiry_month):02d}{int(expiry_year):02d}"
+        updated_expiry = f"{expiry_month}{expiry_year}"
         try:
             item_label, new_stock, updated_expiry_display = restock_inventory_item(
                 conn,
