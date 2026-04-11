@@ -195,7 +195,13 @@ def clean_stock_data(raw_df: pd.DataFrame | None) -> pd.DataFrame:
 
 
 def clean_consumables_data(raw_df: pd.DataFrame | None) -> pd.DataFrame:
-    return clean_inventory_data(raw_df, blank_id_template="CON-{index:03d}")
+    df = clean_inventory_data(
+        raw_df,
+        blank_id_template="CON-{index:03d}",
+        extra_text_columns=(VACCINE_CATEGORY_COLUMN,),
+    )
+    df[VACCINE_CATEGORY_COLUMN] = df[VACCINE_CATEGORY_COLUMN].replace("", pd.NA).fillna("consumable")
+    return df
 
 
 def prepare_inventory_sheet_data(

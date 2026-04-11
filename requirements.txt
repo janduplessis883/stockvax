@@ -1,5 +1,4 @@
-st-gsheets-connection
+st-supabase-connection
 streamlit
 pandas
-gspread
 resend

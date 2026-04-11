@@ -7,10 +7,9 @@ from typing import Callable
 from urllib.parse import quote
 
 import altair as alt
-from gspread import WorksheetNotFound
 import pandas as pd
 import streamlit as st
-from streamlit_gsheets import GSheetsConnection
+from st_supabase_connection import SupabaseConnection
 
 from app_constants import (
     BASE_COLUMNS,
@@ -50,15 +49,16 @@ from inventory_logic import (
     split_expiry_parts,
 )
 from sheets_backend import (
-    append_vaccine_log_row,
+    apply_inventory_movement,
     fetch_consumables_snapshot,
     fetch_snapshot,
+    load_inventory_log_data,
     load_inventory_log_data_cached,
-    load_qr_base_url,
-    save_qr_base_url,
-    select_live_worksheet,
+    load_stock_movements_cached,
+    load_live_inventory_frame,
+    load_qr_base_url as backend_load_qr_base_url,
+    save_qr_base_url as backend_save_qr_base_url,
     sync_inventory_sheet,
-    update_inventory_cells_by_id,
 )
 
 
@@ -114,13 +114,13 @@ def inventory_config_for_item_id(
 
 
 def fetch_inventory_item(
-    conn: GSheetsConnection,
+    conn: SupabaseConnection,
     item_id: str,
 ) -> tuple[pd.DataFrame, pd.Series, str | None, Callable[[pd.DataFrame | None], pd.DataFrame], str, str]:
     worksheet_name, cleaner, generic_column_name, item_label = inventory_config_for_item_id(item_id)
-    latest_df = cleaner(conn.read(worksheet=worksheet_name, ttl=0))
+    latest_df = load_live_inventory_frame(conn, worksheet_name, cleaner=cleaner)
     if latest_df.empty:
-        raise ValueError(f"The {item_label.lower()} sheet is empty.")
+        raise ValueError(f"The {item_label.lower()} inventory is empty.")
 
     match = latest_df["id"].astype(str).str.strip().str.upper() == item_id.strip().upper()
     if not match.any():
@@ -131,52 +131,37 @@ def fetch_inventory_item(
 
 
 def restock_inventory_item(
-    conn: GSheetsConnection,
+    conn: SupabaseConnection,
     item_id: str,
     amount: int,
     expiry_value: str | None = None,
 ) -> tuple[str, int, str]:
-    latest_df, row, worksheet_name, _, _, item_label = fetch_inventory_item(conn, item_id)
-    row_index = row.name
-    current_stock = int(latest_df.at[row_index, "stock_level"])
-    latest_df.at[row_index, "stock_level"] = current_stock + int(amount)
-    updates = {"stock_level": int(latest_df.at[row_index, "stock_level"])}
-    if expiry_value is not None:
-        latest_df.at[row_index, "expiry_date"] = expiry_value
-        updates["expiry_date"] = expiry_value
-    stock_worksheet = select_live_worksheet(conn, worksheet_name)
-    update_inventory_cells_by_id(stock_worksheet, {item_id: updates})
-    return item_label, int(latest_df.at[row_index, "stock_level"]), format_expiry_display(latest_df.at[row_index, "expiry_date"])
+    latest_df, row, _, _, _, item_label = fetch_inventory_item(conn, item_id)
+    quantity_received = int(amount)
+    updated_row = apply_inventory_movement(
+        conn,
+        item_code=item_id,
+        quantity=quantity_received,
+        movement_type="delivery",
+        source="qr_restock",
+        expiry_text=expiry_value,
+    )
+    return item_label, int(updated_row["current_stock"]), format_expiry_display(updated_row.get("expiry_text"))
 
 
-def consume_inventory_item(conn: GSheetsConnection, item_id: str, amount: int) -> tuple[str, int]:
-    latest_df, row, worksheet_name, _, _, item_label = fetch_inventory_item(conn, item_id)
-    row_index = row.name
-    current_stock = int(latest_df.at[row_index, "stock_level"])
+def consume_inventory_item(conn: SupabaseConnection, item_id: str, amount: int) -> tuple[str, int]:
+    latest_df, row, _, _, _, item_label = fetch_inventory_item(conn, item_id)
+    current_stock = int(row["stock_level"])
     if amount <= 0:
         raise ValueError("Amount used must be greater than zero.")
-    if amount > current_stock:
-        raise ValueError("Amount used cannot be more than current stock.")
-
-    latest_df.at[row_index, "stock_level"] = current_stock - int(amount)
-    stock_worksheet = select_live_worksheet(conn, worksheet_name)
-    update_inventory_cells_by_id(
-        stock_worksheet,
-        {item_id: {"stock_level": int(latest_df.at[row_index, "stock_level"])}},
+    updated_row = apply_inventory_movement(
+        conn,
+        item_code=item_id,
+        quantity=int(amount),
+        movement_type="consume",
+        source="qr_consume",
     )
-
-    log_worksheet_name = CONSUMABLES_LOG_WORKSHEET_NAME if item_id.strip().upper().startswith("CON-") else LOG_WORKSHEET_NAME
-    log_worksheet = select_live_worksheet(conn, log_worksheet_name)
-    item_name = latest_df.at[row_index, "brand_name"] or latest_df.at[row_index, "generic_name"] or item_id
-    append_vaccine_log_row(
-        log_worksheet,
-        vaccine_id=item_id,
-        vaccine_name=item_name,
-        stock_left_before_click=current_stock,
-        doses_given=int(amount),
-    )
-
-    return item_label, int(latest_df.at[row_index, "stock_level"])
+    return item_label, int(updated_row["current_stock"])
 
 
 def app_url_for_item(item_id: str, mode: str) -> str:
@@ -200,19 +185,12 @@ def get_qr_base_url() -> str:
     return normalize_qr_base_url(st.session_state.get("qr_base_url")) or DEFAULT_APP_BASE_URL
 
 
-def load_qr_base_url(conn: GSheetsConnection) -> str:
-    try:
-        config_worksheet = select_live_worksheet(conn, CONFIG_WORKSHEET_NAME)
-        return normalize_qr_base_url(config_worksheet.acell("A1").value) or DEFAULT_APP_BASE_URL
-    except WorksheetNotFound:
-        return DEFAULT_APP_BASE_URL
-    except Exception:
-        return DEFAULT_APP_BASE_URL
+def load_qr_base_url(conn: SupabaseConnection) -> str:
+    return normalize_qr_base_url(backend_load_qr_base_url(conn)) or DEFAULT_APP_BASE_URL
 
 
-def save_qr_base_url(conn: GSheetsConnection, base_url: str) -> None:
-    config_worksheet = select_live_worksheet(conn, CONFIG_WORKSHEET_NAME)
-    config_worksheet.update_acell("A1", base_url)
+def save_qr_base_url(conn: SupabaseConnection, base_url: str) -> None:
+    backend_save_qr_base_url(conn, base_url)
 
 
 def queue_qr_base_url_input_sync(base_url: str) -> None:
@@ -221,7 +199,7 @@ def queue_qr_base_url_input_sync(base_url: str) -> None:
     st.session_state["qr_base_url_input_pending"] = normalized_value
 
 
-def handle_qr_base_url_change(conn: GSheetsConnection) -> None:
+def handle_qr_base_url_change(conn: SupabaseConnection) -> None:
     submitted_value = normalize_qr_base_url(st.session_state.get("qr_base_url_input"))
     if not submitted_value:
         queue_qr_base_url_input_sync(get_qr_base_url())
@@ -359,7 +337,7 @@ def set_toast(message: str, icon: str | None = None) -> None:
     st.session_state.setdefault("toast_queue", []).append({"message": message, "icon": icon})
 
 
-def initialize_app_state(conn: GSheetsConnection) -> None:
+def initialize_app_state(conn: SupabaseConnection) -> None:
     if "worksheet_name" not in st.session_state:
         st.session_state["worksheet_name"] = ""
     if "qr_base_url" not in st.session_state:
@@ -415,7 +393,7 @@ def source_banner() -> None:
     for label, source_kind, message in sections:
         if not message:
             continue
-        if source_kind == "google":
+        if source_kind == "supabase":
             badge_label = message.removeprefix(":material/database_upload: ").strip()
             st.success(
                 f"{label}: {badge_label}",
@@ -600,8 +578,8 @@ def render_title_banner() -> None:
     st.html(banner_html)
 
 
-def render_sidebar(conn: GSheetsConnection) -> None:
-    st.sidebar.header("Sheet connection")
+def render_sidebar(conn: SupabaseConnection) -> None:
+    st.sidebar.header("Supabase connection")
     with st.sidebar:
         st.html(
             """
@@ -683,26 +661,33 @@ def render_sidebar(conn: GSheetsConnection) -> None:
     st.sidebar.text_input(
         "QR base URL",
         key="qr_base_url_input",
-        help="Saved to config!A1 and used for all restock and consume QR codes.",
+        help="Saved to app_config.qr_base_url and used for all restock and consume QR codes.",
         on_change=handle_qr_base_url_change,
         args=(conn,),
         placeholder=DEFAULT_APP_BASE_URL,
     )
 
-    refresh_clicked = st.sidebar.button("Refresh from Google Sheet", width="stretch")
+    refresh_clicked = st.sidebar.button("Refresh from Supabase", width="stretch")
 
-    st.sidebar.caption("Editor saves rewrite the relevant table in Google Sheets, so avoid concurrent edits in multiple browser sessions.")
+    st.sidebar.caption("Editor saves update Supabase inventory records directly, so avoid concurrent edits in multiple browser sessions.")
 
     if refresh_clicked:
+        load_inventory_log_data_cached.clear()
+        load_stock_movements_cached.clear()
         apply_snapshot(
             fetch_snapshot(conn, selected_worksheet_name(), load_sample_stock),
         )
         apply_consumables_snapshot(fetch_consumables_snapshot(conn))
+        st.session_state[state_key("vaccine", "log_data")] = load_inventory_log_data(conn, LOG_WORKSHEET_NAME)
+        st.session_state[state_key("consumables", "log_data")] = load_inventory_log_data(
+            conn,
+            CONSUMABLES_LOG_WORKSHEET_NAME,
+        )
         refreshed_qr_base_url = load_qr_base_url(conn)
         queue_qr_base_url_input_sync(refreshed_qr_base_url)
         set_flash(
             "badge",
-            "Data refreshed from Sheets.",
+            "Data and activity plots refreshed from Supabase.",
             icon=":material/refresh:",
             color="yellow",
         )
@@ -858,6 +843,8 @@ def render_stock_usage_plot(
     item_label: str,
     value_label: str,
     bar_size: int = 22,
+    horizontal: bool = False,
+    wrap_in_container: bool = False,
 ) -> None:
     plot_df = (
         stock_df[["brand_name", "stock_level", "expected_monthly_use"]]
@@ -890,10 +877,62 @@ def render_stock_usage_plot(
         }
     )
 
-    chart = (
-        alt.Chart(long_plot_df)
-        .mark_bar(size=bar_size)
-        .encode(
+    base_chart = alt.Chart(long_plot_df).mark_bar(size=bar_size).encode(
+        color=alt.Color(
+            "series:N",
+            scale=alt.Scale(
+                domain=["Stock level", "Expected monthly use"],
+                range=[primary_color, comparison_color],
+            ),
+            legend=alt.Legend(
+                title=None,
+                orient="bottom",
+                direction="horizontal",
+                labelColor=tick_color,
+                symbolType="square",
+            ),
+        ),
+        order=alt.Order(
+            "series_order:Q",
+            sort="ascending",
+        ),
+        tooltip=[
+            alt.Tooltip("brand_name:N", title=item_label),
+            alt.Tooltip("series:N", title="Series"),
+            alt.Tooltip("value:Q", title=value_label, format=".0f"),
+        ],
+    )
+
+    if horizontal:
+        chart = base_chart.encode(
+            y=alt.Y(
+                "brand_name:N",
+                sort=plot_df["brand_name"].tolist(),
+                axis=alt.Axis(
+                    title=None,
+                    labelColor=tick_color,
+                    labelFontSize=11,
+                    labelPadding=8,
+                    ticks=False,
+                ),
+            ),
+            x=alt.X(
+                "sum(value):Q",
+                title=None,
+                axis=alt.Axis(
+                    labelColor=tick_color,
+                    labelFontSize=11,
+                    gridColor=grid_color,
+                    domain=False,
+                    tickColor=grid_color,
+                ),
+            ),
+        ).properties(
+            title=title,
+            height=max(420, len(plot_df) * 22),
+        )
+    else:
+        chart = base_chart.encode(
             x=alt.X(
                 "brand_name:N",
                 sort=plot_df["brand_name"].tolist(),
@@ -917,42 +956,22 @@ def render_stock_usage_plot(
                     tickColor=grid_color,
                 ),
             ),
-            color=alt.Color(
-                "series:N",
-                scale=alt.Scale(
-                    domain=["Stock level", "Expected monthly use"],
-                    range=[primary_color, comparison_color],
-                ),
-                legend=alt.Legend(
-                    title=None,
-                    orient="bottom",
-                    direction="horizontal",
-                    labelColor=tick_color,
-                    symbolType="square",
-                ),
-            ),
-            order=alt.Order(
-                "series_order:Q",
-                sort="ascending",
-            ),
-            tooltip=[
-                alt.Tooltip("brand_name:N", title=item_label),
-                alt.Tooltip("series:N", title="Series"),
-                alt.Tooltip("value:Q", title=value_label, format=".0f"),
-            ],
-        )
-        .properties(
+        ).properties(
             title=title,
             height=420,
         )
-        .configure_title(
-            anchor="start",
-            color=text_color,
-            fontSize=18,
-            fontWeight="bold",
-        )
-        .configure_view(strokeOpacity=0)
-    )
+
+    chart = chart.configure_title(
+        anchor="start",
+        color=text_color,
+        fontSize=18,
+        fontWeight="bold",
+    ).configure_view(strokeOpacity=0)
+
+    if wrap_in_container:
+        with st.container(border=True):
+            st.altair_chart(chart, width="stretch")
+        return
 
     st.altair_chart(chart, width="stretch")
 
@@ -1085,7 +1104,7 @@ def render_inventory_activity_plot(
         alt.layer(area, trend_line, pulse_points, peak_highlight, peak_label)
         .properties(
             title=title,
-            height=320,
+            height=272,
         )
         .configure_title(
             anchor="start",
@@ -1131,6 +1150,93 @@ def render_split_vaccine_stock_usage_plots(
         item_label="Emergency drug",
         value_label=value_label,
         bar_size=33,
+    )
+
+
+def split_vaccine_activity_logs(log_df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
+    if log_df.empty:
+        return log_df.copy(), log_df.copy()
+
+    emergency_mask = log_df["vaccine_id"].fillna("").astype(str).str.upper().str.startswith("EMER-")
+    vaccine_log_df = log_df[~emergency_mask].reset_index(drop=True)
+    emergency_log_df = log_df[emergency_mask].reset_index(drop=True)
+    return vaccine_log_df, emergency_log_df
+
+
+def render_split_vaccine_activity_plots(
+    log_df: pd.DataFrame,
+    *,
+    activity_colors: tuple[str, str],
+) -> None:
+    vaccine_log_df, emergency_log_df = split_vaccine_activity_logs(log_df)
+    emergency_activity_colors = ("#d849ab", "#8e5db7")
+
+    render_inventory_activity_plot(
+        vaccine_log_df,
+        title="Daily vaccines activity",
+        empty_message="No vaccine activity has been logged yet.",
+        item_label_plural="Vaccines",
+        activity_value_label="Vaccines given",
+        activity_colors=activity_colors,
+    )
+    render_inventory_activity_plot(
+        emergency_log_df,
+        title="Daily emergency drugs activity",
+        empty_message="No emergency drug activity has been logged yet.",
+        item_label_plural="Emergency drugs",
+        activity_value_label="Emergency drugs given",
+        activity_colors=emergency_activity_colors,
+    )
+
+
+def render_split_vaccine_overview_plots(
+    stock_df: pd.DataFrame,
+    log_df: pd.DataFrame,
+    *,
+    stock_chart_colors: tuple[str, str],
+    activity_chart_colors: tuple[str, str],
+    value_label: str,
+) -> None:
+    category_series = stock_df.apply(resolve_stock_category, axis=1)
+    vaccine_df = stock_df[category_series != EMERGENCY_DRUG_CATEGORY].reset_index(drop=True)
+    emergency_df = stock_df[category_series == EMERGENCY_DRUG_CATEGORY].reset_index(drop=True)
+    vaccine_log_df, emergency_log_df = split_vaccine_activity_logs(log_df)
+    emergency_stock_colors = ("#d849ab", stock_chart_colors[1])
+    emergency_activity_colors = ("#d849ab", "#8e5db7")
+
+    render_stock_usage_plot(
+        vaccine_df,
+        title="Vaccines: current stock vs expected monthly use",
+        series_colors=stock_chart_colors,
+        empty_message="No vaccine data is available to plot yet.",
+        item_label="Vaccine",
+        value_label=value_label,
+        bar_size=33,
+    )
+    render_inventory_activity_plot(
+        vaccine_log_df,
+        title="Daily vaccines activity",
+        empty_message="No vaccine activity has been logged yet.",
+        item_label_plural="Vaccines",
+        activity_value_label="Vaccines given",
+        activity_colors=activity_chart_colors,
+    )
+    render_stock_usage_plot(
+        emergency_df,
+        title="Emergency drugs: current stock vs expected monthly use",
+        series_colors=emergency_stock_colors,
+        empty_message="No emergency drug data is available to plot yet.",
+        item_label="Emergency drug",
+        value_label=value_label,
+        bar_size=33,
+    )
+    render_inventory_activity_plot(
+        emergency_log_df,
+        title="Daily emergency drugs activity",
+        empty_message="No emergency drug activity has been logged yet.",
+        item_label_plural="Emergency drugs",
+        activity_value_label="Emergency drugs given",
+        activity_colors=emergency_activity_colors,
     )
 
 
@@ -1249,9 +1355,11 @@ def render_inventory_overview(
         st.warning(f"{invalid_expiry_count} expiry value(s) could not be parsed. Use MMYY format, for example 0328.")
 
     if split_vaccine_categories:
-        render_split_vaccine_stock_usage_plots(
+        render_split_vaccine_overview_plots(
             stock_df,
-            series_colors=stock_chart_colors,
+            log_df,
+            stock_chart_colors=stock_chart_colors,
+            activity_chart_colors=activity_chart_colors,
             value_label=value_label,
         )
     else:
@@ -1263,14 +1371,15 @@ def render_inventory_overview(
             item_label=section_title,
             value_label=value_label,
         )
-    render_inventory_activity_plot(
-        log_df,
-        title=f"Daily {item_label_plural.lower()} activity",
-        empty_message=f"No {item_label_plural.lower()} activity has been logged yet.",
-        item_label_plural=item_label_plural,
-        activity_value_label=activity_value_label,
-        activity_colors=activity_chart_colors,
-    )
+    if not split_vaccine_categories:
+        render_inventory_activity_plot(
+            log_df,
+            title=f"Daily {item_label_plural.lower()} activity",
+            empty_message=f"No {item_label_plural.lower()} activity has been logged yet.",
+            item_label_plural=item_label_plural,
+            activity_value_label=activity_value_label,
+            activity_colors=activity_chart_colors,
+        )
 
     st.subheader("Current inventory")
     st.dataframe(
@@ -1294,15 +1403,9 @@ def render_inventory_overview(
         hide_index=True,
     )
 
-    with st.expander(f"View `{log_worksheet_name}` log data", icon=":material/table_view:"):
-        if log_df.empty:
-            st.info(f"No rows are available in `{log_worksheet_name}` yet.")
-        else:
-            st.dataframe(log_df, width="stretch", hide_index=True)
-
 
 def record_inventory_click(
-    conn: GSheetsConnection,
+    conn: SupabaseConnection,
     item_id: str,
     *,
     worksheet_name: str | None,
@@ -1314,12 +1417,11 @@ def record_inventory_click(
     toast_icon: str,
 ) -> None:
     try:
-        latest_df = cleaner(conn.read(worksheet=worksheet_name, ttl=0))
-        stock_worksheet = select_live_worksheet(conn, worksheet_name)
+        latest_df = load_live_inventory_frame(conn, worksheet_name, cleaner=cleaner)
     except Exception as exc:
         set_flash(
             "error",
-            f"Could not record the {item_label_singular.lower()} because Google Sheets could not be reached: {exc}",
+            f"Could not record the {item_label_singular.lower()} because Supabase could not be reached: {exc}",
             icon=":material/error:",
         )
         st.rerun()
@@ -1327,7 +1429,7 @@ def record_inventory_click(
     if latest_df.empty:
         set_flash(
             "error",
-            f"Could not record the {item_label_singular.lower()} because the sheet is empty.",
+            f"Could not record the {item_label_singular.lower()} because the inventory is empty.",
             icon=":material/error:",
         )
         st.rerun()
@@ -1356,31 +1458,14 @@ def record_inventory_click(
     latest_df.at[row_index, "stock_level"] = current_stock - 1
 
     try:
-        log_worksheet = select_live_worksheet(conn, log_worksheet_name)
-        update_inventory_cells_by_id(
-            stock_worksheet,
-            {item_id: {"stock_level": current_stock - 1}},
+        updated_row = apply_inventory_movement(
+            conn,
+            item_code=item_id,
+            quantity=1,
+            movement_type="consume",
+            source="consumables_tab" if item_id.startswith("CON-") else "nurse_tab",
         )
-        append_vaccine_log_row(
-            log_worksheet,
-            vaccine_id=item_id,
-            vaccine_name=item_name,
-            stock_left_before_click=current_stock,
-        )
-    except WorksheetNotFound:
-        set_flash(
-            "error",
-            f"Could not record the {item_label_singular.lower()} because the '{log_worksheet_name}' worksheet was not found.",
-            icon=":material/error:",
-        )
-        st.rerun()
-    except KeyError as exc:
-        set_flash(
-            "error",
-            f"Could not record the {item_label_singular.lower()} because the live sheet structure did not match the app: {exc}",
-            icon=":material/error:",
-        )
-        st.rerun()
+        latest_df.at[row_index, "stock_level"] = int(updated_row["current_stock"])
     except Exception as exc:
         set_flash(
             "error",
@@ -1392,10 +1477,16 @@ def record_inventory_click(
     snapshot_applier(
         StockSnapshot(
             data=latest_df,
-            source_kind="google",
-            message="Live data loaded from Google Sheets.",
+            source_kind="supabase",
+            message="Live data loaded from Supabase.",
         ),
     )
+    load_inventory_log_data_cached.clear()
+    load_stock_movements_cached.clear()
+    if log_worksheet_name == CONSUMABLES_LOG_WORKSHEET_NAME:
+        st.session_state[state_key("consumables", "log_data")] = load_inventory_log_data(conn, log_worksheet_name)
+    else:
+        st.session_state[state_key("vaccine", "log_data")] = load_inventory_log_data(conn, log_worksheet_name)
     set_toast(
         f"{item_name} - 1 {item_label_singular.lower()} {action_word}",
         icon=toast_icon,
@@ -1408,7 +1499,7 @@ def record_inventory_click(
     st.rerun()
 
 
-def give_vaccine_dose(conn: GSheetsConnection, vaccine_id: str) -> None:
+def give_vaccine_dose(conn: SupabaseConnection, vaccine_id: str) -> None:
     record_inventory_click(
         conn,
         vaccine_id,
@@ -1422,7 +1513,7 @@ def give_vaccine_dose(conn: GSheetsConnection, vaccine_id: str) -> None:
     )
 
 
-def use_consumable(conn: GSheetsConnection, consumable_id: str) -> None:
+def use_consumable(conn: SupabaseConnection, consumable_id: str) -> None:
     record_inventory_click(
         conn,
         consumable_id,
@@ -1440,7 +1531,7 @@ def render_inventory_action_tab(
     stock_df: pd.DataFrame,
     log_df: pd.DataFrame,
     *,
-    conn: GSheetsConnection,
+    conn: SupabaseConnection,
     cleaner: Callable[[pd.DataFrame | None], pd.DataFrame],
     expander_title: str,
     section_subheader: str,
@@ -1450,7 +1541,7 @@ def render_inventory_action_tab(
     button_label: str,
     button_icon: str,
     button_key_prefix: str,
-    on_click: Callable[[GSheetsConnection, str], None],
+    on_click: Callable[[SupabaseConnection, str], None],
     chart_colors: tuple[str, str],
     brand_font_size: str = "2.0rem",
     generic_font_size: str = "0.95rem",
@@ -1664,7 +1755,7 @@ def render_inventory_action_tab(
     render_card_group(display_df, title=None, empty_group_message=empty_message)
 
 
-def render_nurse_tab(conn: GSheetsConnection, stock_df: pd.DataFrame, log_df: pd.DataFrame) -> None:
+def render_nurse_tab(conn: SupabaseConnection, stock_df: pd.DataFrame, log_df: pd.DataFrame) -> None:
     render_inventory_action_tab(
         stock_df,
         log_df,
@@ -1684,7 +1775,7 @@ def render_nurse_tab(conn: GSheetsConnection, stock_df: pd.DataFrame, log_df: pd
     )
 
 
-def render_consumables_tab(conn: GSheetsConnection, stock_df: pd.DataFrame, log_df: pd.DataFrame) -> None:
+def render_consumables_tab(conn: SupabaseConnection, stock_df: pd.DataFrame, log_df: pd.DataFrame) -> None:
     render_inventory_action_tab(
         stock_df,
         log_df,
@@ -1707,7 +1798,7 @@ def render_consumables_tab(conn: GSheetsConnection, stock_df: pd.DataFrame, log_
 
 
 def apply_inventory_delivery(
-    conn: GSheetsConnection,
+    conn: SupabaseConnection,
     deliveries: dict[str, int],
     *,
     worksheet_name: str | None,
@@ -1719,9 +1810,9 @@ def apply_inventory_delivery(
     if not positive_deliveries:
         return None, []
 
-    latest_df = cleaner(conn.read(worksheet=worksheet_name, ttl=0))
+    latest_df = load_live_inventory_frame(conn, worksheet_name, cleaner=cleaner)
     if latest_df.empty:
-        raise ValueError(f"The {item_label_plural.lower()} sheet is empty.")
+        raise ValueError(f"The {item_label_plural.lower()} inventory is empty.")
 
     recorded_items: list[str] = []
     for item_id, amount in positive_deliveries.items():
@@ -1731,26 +1822,23 @@ def apply_inventory_delivery(
 
         row_index = latest_df.index[match][0]
         item_name = latest_df.at[row_index, "brand_name"] or latest_df.at[row_index, "generic_name"] or item_id
-        latest_df.at[row_index, "stock_level"] = int(latest_df.at[row_index, "stock_level"]) + int(amount)
+        updated_row = apply_inventory_movement(
+            conn,
+            item_code=item_id,
+            quantity=int(amount),
+            movement_type="delivery",
+            source="delivery_tab",
+        )
+        latest_df.at[row_index, "stock_level"] = int(updated_row["current_stock"])
         recorded_items.append(f"{item_name} (+{amount})")
 
     if not recorded_items:
         raise ValueError(f"None of the {item_label_plural.lower()} delivery rows matched the latest live list.")
-
-    stock_worksheet = select_live_worksheet(conn, worksheet_name)
-    update_inventory_cells_by_id(
-        stock_worksheet,
-        {
-            item_id: {"stock_level": int(latest_df.loc[latest_df["id"] == item_id, "stock_level"].iloc[0])}
-            for item_id, amount in positive_deliveries.items()
-            if amount > 0 and (latest_df["id"] == item_id).any()
-        },
-    )
     return latest_df, recorded_items
 
 
 def record_delivery(
-    conn: GSheetsConnection,
+    conn: SupabaseConnection,
     vaccine_deliveries: dict[str, int],
     consumable_deliveries: dict[str, int],
 ) -> None:
@@ -1777,11 +1865,12 @@ def record_delivery(
             generic_column_name="generic_name",
         )
         if vaccine_df is not None:
+            load_stock_movements_cached.clear()
             apply_snapshot(
                 StockSnapshot(
                     data=vaccine_df,
-                    source_kind="google",
-                    message="Live data loaded from Sheets.",
+                    source_kind="supabase",
+                    message="Live data loaded from Supabase.",
                 ),
             )
             completed_sections.append("vaccines")
@@ -1796,11 +1885,12 @@ def record_delivery(
             generic_column_name="generic_name_description",
         )
         if consumables_df is not None:
+            load_stock_movements_cached.clear()
             apply_consumables_snapshot(
                 StockSnapshot(
                     data=consumables_df,
-                    source_kind="google",
-                    message="Live data loaded from Google Sheets.",
+                    source_kind="supabase",
+                    message="Live data loaded from Supabase.",
                 ),
             )
             completed_sections.append("consumables")
@@ -1893,9 +1983,59 @@ def render_delivery_section(
     return qr_request
 
 
-def render_delivery_tab(conn: GSheetsConnection, vaccine_df: pd.DataFrame, consumables_df: pd.DataFrame) -> None:
+def delivery_quantities_from_state(display_df: pd.DataFrame, *, input_key_prefix: str) -> dict[str, int]:
+    return {
+        row["id"]: int(st.session_state.get(f"{input_key_prefix}_{row['id']}", 0))
+        for _, row in display_df.iterrows()
+    }
+
+
+def render_delivery_form(
+    conn: SupabaseConnection,
+    display_df: pd.DataFrame,
+    *,
+    section_title: str,
+    input_key_prefix: str,
+    submit_label: str,
+    vaccine_deliveries: bool,
+) -> None:
+    if display_df.empty:
+        st.markdown(f"## {section_title}")
+        st.info(f"No {section_title.lower()} are available in the stock list yet.")
+        return
+
+    with st.form(f"{input_key_prefix}_form", clear_on_submit=True, width="stretch", border=False):
+        qr_request = render_delivery_section(
+            display_df,
+            section_title=section_title,
+            input_key_prefix=input_key_prefix,
+        )
+        submitted = st.form_submit_button(
+            submit_label,
+            type="primary",
+            icon=":material/local_shipping:",
+            width="stretch",
+        )
+
+    if qr_request is not None:
+        item_id, item_name, qr_section_title, mode = qr_request
+        show_item_qr_dialog(item_id, item_name, qr_section_title, mode)
+        return
+
+    if not submitted:
+        return
+
+    deliveries = delivery_quantities_from_state(display_df, input_key_prefix=input_key_prefix)
+    if vaccine_deliveries:
+        record_delivery(conn, deliveries, {})
+    else:
+        record_delivery(conn, {}, deliveries)
+
+def render_delivery_tab(conn: SupabaseConnection, vaccine_df: pd.DataFrame, consumables_df: pd.DataFrame) -> None:
     st.subheader(":material/local_shipping: Record delivery")
-    st.caption("Enter any new stock delivered today for vaccines or consumables, then save once to add the quantities onto the live stock levels.")
+    st.caption(
+        "Enter delivered stock and save each section separately so vaccines, emergency drugs, and consumables are recorded independently."
+    )
 
     vaccine_category_series = vaccine_df.apply(resolve_stock_category, axis=1)
     vaccine_display_df = (
@@ -1963,53 +2103,33 @@ def render_delivery_tab(conn: GSheetsConnection, vaccine_df: pd.DataFrame, consu
         """
     )
 
-    with st.form("record_delivery_form", clear_on_submit=True, width="stretch"):
-        qr_request = render_delivery_section(
+    with st.expander("Vaccines", expanded=False, icon=":material/syringe:"):
+        render_delivery_form(
+            conn,
             vaccine_display_df,
             section_title=":material/syringe: Vaccines",
             input_key_prefix="delivery_vaccine",
+            submit_label="Record vaccine delivery",
+            vaccine_deliveries=True,
         )
-        st.divider()
-        emergency_qr_request = render_delivery_section(
+    with st.expander("Emergency drugs", expanded=False, icon=":material/ecg_heart:"):
+        render_delivery_form(
+            conn,
             emergency_display_df,
             section_title=":material/ecg_heart: Emergency drugs",
             input_key_prefix="delivery_emergency",
+            submit_label="Record emergency drug delivery",
+            vaccine_deliveries=True,
         )
-        qr_request = emergency_qr_request or qr_request
-        st.divider()
-        consumables_qr_request = render_delivery_section(
+    with st.expander("Consumables", expanded=False, icon=":material/clean_hands:"):
+        render_delivery_form(
+            conn,
             consumables_display_df,
             section_title=":material/clean_hands: Consumables",
             input_key_prefix="delivery_consumable",
+            submit_label="Record consumable delivery",
+            vaccine_deliveries=False,
         )
-        qr_request = consumables_qr_request or qr_request
-
-        submitted = st.form_submit_button(
-            "Record delivery",
-            type="primary",
-            icon=":material/local_shipping:",
-            width="stretch",
-        )
-
-    if qr_request is not None:
-        item_id, item_name, section_title, mode = qr_request
-        show_item_qr_dialog(item_id, item_name, section_title, mode)
-        return
-
-    if submitted:
-        vaccine_deliveries = {
-            row["id"]: int(st.session_state.get(f"delivery_vaccine_{row['id']}", 0))
-            for _, row in vaccine_display_df.iterrows()
-        }
-        emergency_deliveries = {
-            row["id"]: int(st.session_state.get(f"delivery_emergency_{row['id']}", 0))
-            for _, row in emergency_display_df.iterrows()
-        }
-        consumable_deliveries = {
-            row["id"]: int(st.session_state.get(f"delivery_consumable_{row['id']}", 0))
-            for _, row in consumables_display_df.iterrows()
-        }
-        record_delivery(conn, {**vaccine_deliveries, **emergency_deliveries}, consumable_deliveries)
 
     st.divider()
     batch_vaccine_column, batch_emergency_column, batch_consumable_column = st.columns(3)
@@ -2058,7 +2178,7 @@ def render_delivery_tab(conn: GSheetsConnection, vaccine_df: pd.DataFrame, consu
 
 
 def render_editor_section(
-    conn: GSheetsConnection,
+    conn: SupabaseConnection,
     stock_df: pd.DataFrame,
     *,
     section_title: str,
@@ -2097,7 +2217,7 @@ def render_editor_section(
         width="stretch",
         disabled=["id"],
         column_config={
-            "id": st.column_config.TextColumn("ID"),
+            "id": st.column_config.TextColumn("Item code"),
             "brand_name": st.column_config.TextColumn("Brand name", required=True),
             "generic_name": st.column_config.TextColumn(generic_name_label, required=True),
             EXPIRY_MONTH_COLUMN: st.column_config.SelectboxColumn(
@@ -2120,7 +2240,7 @@ def render_editor_section(
             "order_level": st.column_config.NumberColumn("Order level", min_value=0, step=1, format="%d"),
             "category": st.column_config.SelectboxColumn(
                 "Category",
-                options=[VACCINE_CATEGORY, EMERGENCY_DRUG_CATEGORY],
+                options=[VACCINE_CATEGORY, EMERGENCY_DRUG_CATEGORY, "consumable"],
                 required=False,
             ),
         },
@@ -2169,18 +2289,19 @@ def render_editor_section(
                 cleaner=cleaner,
                 generic_column_name=generic_column_name,
             )
+            load_stock_movements_cached.clear()
             snapshot_applier(
                 StockSnapshot(
                     data=saved_df,
-                    source_kind="google",
-                    message="Changes saved to Google Sheets.",
+                    source_kind="supabase",
+                    message="Changes saved to Supabase.",
                 ),
                 "success",
-                f"The {section_title.lower()} table was saved to Google Sheets.",
+                f"The {section_title.lower()} table was saved to Supabase.",
             )
             st.rerun()
         except Exception as exc:
-            st.error(f"Could not save {section_title.lower()} to Google Sheets: {exc}")
+            st.error(f"Could not save {section_title.lower()} to Supabase: {exc}")
 
     if discard_clicked:
         if worksheet_name == CONSUMABLES_WORKSHEET_NAME:
@@ -2200,8 +2321,8 @@ def render_editor_section(
         st.rerun()
 
 
-def render_editor(conn: GSheetsConnection, vaccine_df: pd.DataFrame, consumables_df: pd.DataFrame) -> None:
-    st.write("Edit the tables below, add rows at the bottom if needed, then save each table back to Google Sheets.")
+def render_editor(conn: SupabaseConnection, vaccine_df: pd.DataFrame, consumables_df: pd.DataFrame) -> None:
+    st.write("Edit the tables below, add rows at the bottom if needed, then save each table back to Supabase.")
     st.caption("IDs are generated automatically when blank. Use expiry format MMYY, for example 0328.")
 
     vaccine_only_df = vaccine_df[
@@ -2221,7 +2342,7 @@ def render_editor(conn: GSheetsConnection, vaccine_df: pd.DataFrame, consumables
         editor_key="vaccine_stock_editor",
         generic_name_label="Generic name",
         generic_column_name="generic_name",
-        save_button_label="Save vaccines to Google Sheet",
+        save_button_label="Save vaccines to Supabase",
         download_file_name="stockvax_vaccines_snapshot.csv",
         full_stock_df=vaccine_df,
         default_category=VACCINE_CATEGORY,
@@ -2237,7 +2358,7 @@ def render_editor(conn: GSheetsConnection, vaccine_df: pd.DataFrame, consumables
         editor_key="emergency_stock_editor",
         generic_name_label="Generic name",
         generic_column_name="generic_name",
-        save_button_label="Save emergency drugs to Google Sheet",
+        save_button_label="Save emergency drugs to Supabase",
         download_file_name="stockvax_emergency_drugs_snapshot.csv",
         full_stock_df=vaccine_df,
         default_category=EMERGENCY_DRUG_CATEGORY,
@@ -2253,12 +2374,41 @@ def render_editor(conn: GSheetsConnection, vaccine_df: pd.DataFrame, consumables
         editor_key="consumables_stock_editor",
         generic_name_label="Generic name / description",
         generic_column_name="generic_name_description",
-        save_button_label="Save consumables to Google Sheet",
+        save_button_label="Save consumables to Supabase",
         download_file_name="stockvax_consumables_snapshot.csv",
+        default_category="consumable",
     )
 
 
-def render_restock_mode(conn: GSheetsConnection) -> None:
+def render_stock_movements_tab(conn: SupabaseConnection) -> None:
+    st.subheader(":material/sync_alt: Stock movements")
+    st.caption("Read-only movement history from Supabase, sorted by brand name and newest movement first.")
+
+    movement_df = load_stock_movements_cached(conn)
+    if movement_df.empty:
+        st.info("No stock movements have been recorded yet.")
+        return
+
+    st.dataframe(
+        movement_df,
+        hide_index=True,
+        width="stretch",
+        column_config={
+            "brand_name": st.column_config.TextColumn("Brand name"),
+            "item_code": st.column_config.TextColumn("Item code"),
+            "category": st.column_config.TextColumn("Category"),
+            "movement_type": st.column_config.TextColumn("Movement type"),
+            "quantity": st.column_config.NumberColumn("Quantity", format="%d"),
+            "stock_before": st.column_config.NumberColumn("Stock before", format="%d"),
+            "stock_after": st.column_config.NumberColumn("Stock after", format="%d"),
+            "timestamp": st.column_config.DatetimeColumn("Timestamp", format="DD/MM/YYYY HH:mm"),
+            "source": st.column_config.TextColumn("Source"),
+            "notes": st.column_config.TextColumn("Notes"),
+        },
+    )
+
+
+def render_restock_mode(conn: SupabaseConnection) -> None:
     item_id = query_param_value("item_id", "item-id").upper()
     render_mobile_inventory_shell_open()
 
@@ -2274,7 +2424,7 @@ def render_restock_mode(conn: GSheetsConnection) -> None:
         render_mobile_inventory_shell_close()
         return
     except Exception as exc:
-        st.error(f"Could not load `{item_id}` from Google Sheets: {exc}")
+        st.error(f"Could not load `{item_id}` from Supabase: {exc}")
         render_mobile_inventory_shell_close()
         return
 
@@ -2331,7 +2481,7 @@ def render_restock_mode(conn: GSheetsConnection) -> None:
     render_mobile_inventory_shell_close()
 
 
-def render_consume_mode(conn: GSheetsConnection) -> None:
+def render_consume_mode(conn: SupabaseConnection) -> None:
     item_id = query_param_value("item_id", "item-id").upper()
     render_mobile_inventory_shell_open()
 
@@ -2347,7 +2497,7 @@ def render_consume_mode(conn: GSheetsConnection) -> None:
         render_mobile_inventory_shell_close()
         return
     except Exception as exc:
-        st.error(f"Could not load `{item_id}` from Google Sheets: {exc}")
+        st.error(f"Could not load `{item_id}` from Supabase: {exc}")
         render_mobile_inventory_shell_close()
         return
 
@@ -2508,7 +2658,7 @@ def render_batch_qr_sheet(display_df: pd.DataFrame, section_title: str) -> None:
 
 
 def render_app() -> None:
-    conn = st.connection("gsheets", type=GSheetsConnection)
+    conn = st.connection("supabase", type=SupabaseConnection)
 
     if is_restock_mode():
         render_restock_mode(conn)
@@ -2536,6 +2686,7 @@ def render_app() -> None:
         "Vaccine | Emergency Rx overview",
         "Consumables overview",
         "Record delivery",
+        "Stock movements",
         "Stock editor",
     ]
     if "active_section" not in st.session_state:
@@ -2547,6 +2698,7 @@ def render_app() -> None:
         vaccine_overview_tab,
         consumables_overview_tab,
         delivery_tab,
+        movements_tab,
         editor_tab,
     ) = st.tabs(
         navigation_options,
@@ -2566,7 +2718,7 @@ def render_app() -> None:
         if vaccine_overview_tab.open:
             vaccine_overview_df = stock_with_metrics
             live_vaccine_snapshot = fetch_snapshot(conn, selected_worksheet_name(), load_sample_stock)
-            if live_vaccine_snapshot.source_kind in {"google", "info", "sample"}:
+            if live_vaccine_snapshot.source_kind in {"supabase", "info", "sample"}:
                 vaccine_overview_df = add_inventory_metrics(
                     live_vaccine_snapshot.data,
                     cleaner=clean_stock_data,
@@ -2591,7 +2743,7 @@ def render_app() -> None:
         if consumables_overview_tab.open:
             consumables_overview_df = consumables_with_metrics
             live_consumables_snapshot = fetch_consumables_snapshot(conn)
-            if live_consumables_snapshot.source_kind in {"google", "info"}:
+            if live_consumables_snapshot.source_kind in {"supabase", "info"}:
                 consumables_overview_df = add_inventory_metrics(
                     live_consumables_snapshot.data,
                     cleaner=clean_consumables_data,
@@ -2614,6 +2766,10 @@ def render_app() -> None:
     with delivery_tab:
         if delivery_tab.open:
             render_delivery_tab(conn, raw_stock, raw_consumables)
+
+    with movements_tab:
+        if movements_tab.open:
+            render_stock_movements_tab(conn)
 
     with editor_tab:
         if editor_tab.open:

@@ -1,285 +1,365 @@
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
+from typing import Any
 
-from gspread import WorksheetNotFound
-from gspread.cell import Cell
-from gspread.worksheet import Worksheet
 import pandas as pd
 import streamlit as st
-from streamlit_gsheets import GSheetsConnection
+from st_supabase_connection import SupabaseConnection, execute_query
 
 from app_constants import (
-    APP_TIMEZONE,
     CONFIG_WORKSHEET_NAME,
     CONSUMABLES_LOG_WORKSHEET_NAME,
     CONSUMABLES_WORKSHEET_NAME,
     DEFAULT_APP_BASE_URL,
+    EMERGENCY_DRUG_CATEGORY,
     LOG_WORKSHEET_NAME,
     StockSnapshot,
+    VACCINE_CATEGORY,
 )
-from inventory_logic import (
-    clean_consumables_data,
-    clean_stock_data,
-    first_log_row_is_header,
-    normalize_column_name,
-    parse_log_timestamp,
-    prepare_inventory_sheet_data,
+from inventory_logic import clean_consumables_data, clean_stock_data
+
+
+INVENTORY_SELECT = (
+    "id,item_code,category,brand_name,generic_name,expiry_text,"
+    "current_stock,expected_monthly_use,order_level,is_active"
 )
 
 
-def select_live_worksheet(conn: GSheetsConnection, worksheet_name: str | None) -> Worksheet:
-    return conn.client._select_worksheet(worksheet=worksheet_name)
+def inventory_scope_categories(worksheet_name: str | None) -> list[str]:
+    if worksheet_name == CONSUMABLES_WORKSHEET_NAME:
+        return ["consumable"]
+    return [VACCINE_CATEGORY, EMERGENCY_DRUG_CATEGORY]
 
 
-def worksheet_column_index(worksheet: Worksheet, column_name: str) -> int:
-    normalized_headers = [normalize_column_name(value) for value in worksheet.row_values(1)]
-    try:
-        return normalized_headers.index(column_name) + 1
-    except ValueError as exc:
-        raise KeyError(column_name) from exc
+def movement_scope_categories(log_worksheet_name: str) -> list[str]:
+    if log_worksheet_name == CONSUMABLES_LOG_WORKSHEET_NAME:
+        return ["consumable"]
+    return [VACCINE_CATEGORY, EMERGENCY_DRUG_CATEGORY]
 
 
-def worksheet_row_by_cell_value(worksheet: Worksheet, column_index: int, target_value: str) -> int | None:
-    for row_number, value in enumerate(worksheet.col_values(column_index)[1:], start=2):
-        if str(value).strip() == target_value:
-            return row_number
-    return None
+def _execute(query: Any, *, ttl: int | str | None = 0):
+    return execute_query(query, ttl=ttl)
 
 
-def _sheet_scalar(value: object) -> object:
-    if pd.isna(value):
-        return ""
-    if hasattr(value, "item"):
-        try:
-            value = value.item()
-        except Exception:
-            pass
-    return value
-
-
-def _comparison_scalar(value: object) -> object:
-    value = _sheet_scalar(value)
-    if isinstance(value, str):
-        return value.strip()
-    if isinstance(value, float) and value.is_integer():
-        return int(value)
-    return value
-
-
-def _worksheet_headers(worksheet: Worksheet) -> list[str]:
-    return worksheet.row_values(1)
-
-
-def _ensure_worksheet_headers(worksheet: Worksheet, desired_headers: list[str]) -> list[str]:
-    raw_headers = _worksheet_headers(worksheet)
-    if not raw_headers:
-        header_cells = [Cell(1, index, header) for index, header in enumerate(desired_headers, start=1)]
-        if header_cells:
-            worksheet.update_cells(header_cells, value_input_option="USER_ENTERED")
-        return desired_headers.copy()
-
-    normalized_headers = [normalize_column_name(header) for header in raw_headers]
-    new_header_cells: list[Cell] = []
-    for header in desired_headers:
-        normalized_header = normalize_column_name(header)
-        if normalized_header not in normalized_headers:
-            raw_headers.append(header)
-            normalized_headers.append(normalized_header)
-            new_header_cells.append(Cell(1, len(raw_headers), header))
-
-    if new_header_cells:
-        worksheet.update_cells(new_header_cells, value_input_option="USER_ENTERED")
-    return raw_headers
-
-
-def _header_index_map(headers: list[str]) -> dict[str, int]:
-    return {
-        normalize_column_name(header): index
-        for index, header in enumerate(headers, start=1)
-        if str(header).strip()
-    }
-
-
-def _worksheet_row_numbers_by_id(worksheet: Worksheet, id_column_index: int) -> dict[str, int]:
-    return {
-        str(value).strip(): row_number
-        for row_number, value in enumerate(worksheet.col_values(id_column_index)[1:], start=2)
-        if str(value).strip()
-    }
-
-
-def update_inventory_cells_by_id(
-    worksheet: Worksheet,
-    updates_by_id: dict[str, dict[str, object]],
-) -> None:
-    if not updates_by_id:
-        return
-
-    headers = _ensure_worksheet_headers(worksheet, ["id"])
-    header_index = _header_index_map(headers)
-    if "id" not in header_index:
-        raise KeyError("id")
-
-    row_numbers_by_id = _worksheet_row_numbers_by_id(worksheet, header_index["id"])
-    cells: list[Cell] = []
-    missing_ids: list[str] = []
-
-    for item_id, updates in updates_by_id.items():
-        row_number = row_numbers_by_id.get(str(item_id).strip())
-        if row_number is None:
-            missing_ids.append(str(item_id))
-            continue
-
-        for column_name, value in updates.items():
-            normalized_column = normalize_column_name(column_name)
-            column_index = header_index.get(normalized_column)
-            if column_index is None:
-                raise KeyError(column_name)
-            cells.append(Cell(row_number, column_index, _sheet_scalar(value)))
-
-    if missing_ids:
-        raise KeyError(", ".join(missing_ids))
-    if cells:
-        worksheet.update_cells(cells, value_input_option="USER_ENTERED")
-
-
-def _row_values_for_headers(row: pd.Series, headers: list[str]) -> list[object]:
-    normalized_values = {normalize_column_name(column): _sheet_scalar(value) for column, value in row.items()}
-    return [normalized_values.get(normalize_column_name(header), "") for header in headers]
-
-
-def sync_inventory_sheet(
-    conn: GSheetsConnection,
-    worksheet_name: str | None,
+def _query_inventory_rows(
+    conn: SupabaseConnection,
     *,
-    target_df: pd.DataFrame,
-    cleaner: Callable[[pd.DataFrame | None], pd.DataFrame],
-    generic_column_name: str,
-) -> pd.DataFrame:
-    worksheet = select_live_worksheet(conn, worksheet_name)
-    desired_df = prepare_inventory_sheet_data(cleaner(target_df), generic_column_name=generic_column_name)
-    live_df = cleaner(conn.read(worksheet=worksheet_name, ttl=0))
-    live_export_df = prepare_inventory_sheet_data(live_df, generic_column_name=generic_column_name)
+    categories: Iterable[str] | None = None,
+    include_inactive: bool = False,
+    ttl: int | str | None = 0,
+) -> list[dict[str, Any]]:
+    query = conn.table("inventory_items").select(INVENTORY_SELECT)
+    if not include_inactive:
+        query = query.eq("is_active", True)
 
-    headers = _ensure_worksheet_headers(worksheet, desired_df.columns.tolist())
-    header_index = _header_index_map(headers)
-    if "id" not in header_index:
-        raise KeyError("id")
+    categories = list(categories or [])
+    if len(categories) == 1:
+        query = query.eq("category", categories[0])
+    elif len(categories) > 1:
+        query = query.in_("category", categories)
 
-    row_numbers_by_id = _worksheet_row_numbers_by_id(worksheet, header_index["id"])
-    live_by_id = {str(row["id"]).strip(): row for _, row in live_export_df.iterrows()}
-    target_by_id = {str(row["id"]).strip(): row for _, row in desired_df.iterrows()}
-
-    changed_cells: list[Cell] = []
-    for item_id, target_row in target_by_id.items():
-        if item_id not in live_by_id:
-            continue
-        row_number = row_numbers_by_id.get(item_id)
-        if row_number is None:
-            raise KeyError(item_id)
-
-        live_row = live_by_id[item_id]
-        for column_name in desired_df.columns:
-            if column_name == "id":
-                continue
-            if _comparison_scalar(live_row.get(column_name)) == _comparison_scalar(target_row.get(column_name)):
-                continue
-            column_index = header_index.get(normalize_column_name(column_name))
-            if column_index is None:
-                raise KeyError(column_name)
-            changed_cells.append(Cell(row_number, column_index, _sheet_scalar(target_row.get(column_name))))
-
-    if changed_cells:
-        worksheet.update_cells(changed_cells, value_input_option="USER_ENTERED")
-
-    deleted_row_numbers = [
-        row_numbers_by_id[item_id]
-        for item_id in live_by_id
-        if item_id not in target_by_id and item_id in row_numbers_by_id
-    ]
-    for row_number in sorted(deleted_row_numbers, reverse=True):
-        worksheet.delete_rows(row_number)
-
-    for item_id, target_row in target_by_id.items():
-        if item_id in live_by_id:
-            continue
-        worksheet.append_row(_row_values_for_headers(target_row, headers), value_input_option="USER_ENTERED")
-
-    return cleaner(target_df)
+    response = _execute(query.order("brand_name").order("generic_name"), ttl=ttl)
+    return response.data or []
 
 
-def append_vaccine_log_row(
-    log_worksheet: Worksheet,
-    *,
-    vaccine_id: str,
-    vaccine_name: str,
-    stock_left_before_click: int,
-    doses_given: int = 1,
-) -> None:
-    timestamp = pd.Timestamp.now(tz=APP_TIMEZONE).strftime("%Y-%m-%d %H:%M:%S")
-    log_worksheet.append_row(
-        [vaccine_id, vaccine_name, stock_left_before_click, doses_given, timestamp],
-        value_input_option="USER_ENTERED",
+def _inventory_rows_to_app_frame(rows: list[dict[str, Any]]) -> pd.DataFrame:
+    if not rows:
+        return pd.DataFrame(
+            columns=[
+                "id",
+                "brand_name",
+                "generic_name",
+                "expiry_date",
+                "stock_level",
+                "expected_monthly_use",
+                "order_level",
+                "category",
+            ]
+        )
+
+    df = pd.DataFrame(
+        {
+            "id": [row.get("item_code", "") for row in rows],
+            "brand_name": [row.get("brand_name", "") for row in rows],
+            "generic_name": [row.get("generic_name", "") for row in rows],
+            "expiry_date": [row.get("expiry_text", "") for row in rows],
+            "stock_level": [row.get("current_stock", 0) for row in rows],
+            "expected_monthly_use": [row.get("expected_monthly_use", 0) for row in rows],
+            "order_level": [row.get("order_level", 0) for row in rows],
+            "category": [row.get("category", "") for row in rows],
+        }
     )
+    for column in ["id", "brand_name", "generic_name", "expiry_date", "category"]:
+        if column in df.columns:
+            df[column] = df[column].fillna("")
+
+    return df[
+        [
+            "id",
+            "brand_name",
+            "generic_name",
+            "expiry_date",
+            "stock_level",
+            "expected_monthly_use",
+            "order_level",
+            "category",
+        ]
+    ].copy()
 
 
-def load_inventory_log_data(conn: GSheetsConnection, log_worksheet_name: str) -> pd.DataFrame:
+def _item_payload_from_row(row: pd.Series, *, default_category: str | None = None) -> dict[str, Any]:
+    category = str(row.get("category", "")).strip() or (default_category or "")
+    return {
+        "item_code": str(row.get("id", "")).strip(),
+        "category": category,
+        "brand_name": str(row.get("brand_name", "")).strip(),
+        "generic_name": str(row.get("generic_name", "")).strip(),
+        "expiry_text": str(row.get("expiry_date", "")).strip(),
+        "current_stock": int(row.get("stock_level", 0)),
+        "expected_monthly_use": int(row.get("expected_monthly_use", 0)),
+        "order_level": int(row.get("order_level", 0)),
+        "is_active": True,
+    }
+
+
+def _current_inventory_item(conn: SupabaseConnection, item_code: str) -> dict[str, Any]:
+    response = conn.table("inventory_items").select(INVENTORY_SELECT).eq("item_code", item_code).limit(1).execute()
+    rows = response.data or []
+    if not rows:
+        raise KeyError(item_code)
+    return rows[0]
+
+
+def _insert_movement(
+    conn: SupabaseConnection,
+    *,
+    item_id: str,
+    movement_type: str,
+    quantity: int,
+    stock_before: int,
+    stock_after: int,
+    source: str,
+    notes: str | None = None,
+) -> None:
+    conn.table("stock_movements").insert(
+        {
+            "item_id": item_id,
+            "movement_type": movement_type,
+            "quantity": int(quantity),
+            "stock_before": int(stock_before),
+            "stock_after": int(stock_after),
+            "source": source,
+            "notes": notes,
+        }
+    ).execute()
+
+
+def apply_inventory_movement(
+    conn: SupabaseConnection,
+    *,
+    item_code: str,
+    quantity: int,
+    movement_type: str,
+    source: str,
+    expiry_text: str | None = None,
+    notes: str | None = None,
+) -> dict[str, Any]:
+    item_row = _current_inventory_item(conn, item_code)
+    stock_before = int(item_row["current_stock"])
+
+    if quantity <= 0:
+        raise ValueError("Quantity must be greater than zero.")
+
+    if movement_type == "consume":
+        stock_after = stock_before - int(quantity)
+        if stock_after < 0:
+            raise ValueError("Amount used cannot be more than current stock.")
+    elif movement_type == "delivery":
+        stock_after = stock_before + int(quantity)
+    else:
+        raise ValueError(f"Unsupported movement type: {movement_type}")
+
+    update_payload: dict[str, Any] = {"current_stock": stock_after}
+    if expiry_text is not None:
+        update_payload["expiry_text"] = expiry_text
+
+    previous_expiry = item_row.get("expiry_text") or ""
+    conn.table("inventory_items").update(update_payload).eq("id", item_row["id"]).execute()
+    try:
+        _insert_movement(
+            conn,
+            item_id=item_row["id"],
+            movement_type=movement_type,
+            quantity=quantity,
+            stock_before=stock_before,
+            stock_after=stock_after,
+            source=source,
+            notes=notes,
+        )
+    except Exception:
+        rollback_payload: dict[str, Any] = {"current_stock": stock_before}
+        if expiry_text is not None:
+            rollback_payload["expiry_text"] = previous_expiry
+        conn.table("inventory_items").update(rollback_payload).eq("id", item_row["id"]).execute()
+        raise
+
+    item_row.update(update_payload)
+    item_row["current_stock"] = stock_after
+    return item_row
+
+
+def load_inventory_log_data(conn: SupabaseConnection, log_worksheet_name: str) -> pd.DataFrame:
     empty_log = pd.DataFrame(columns=["vaccine_id", "brand_name", "stock_before", "doses_given", "timestamp"])
 
     try:
-        log_df = conn.read(worksheet=log_worksheet_name, ttl=0, header=None)
-    except WorksheetNotFound:
-        return empty_log
+        inventory_rows = _query_inventory_rows(conn, include_inactive=True, ttl=0)
+        movement_rows = (
+            conn.table("stock_movements")
+            .select("item_id,movement_type,quantity,stock_before,occurred_at")
+            .eq("movement_type", "consume")
+            .order("occurred_at")
+            .execute()
+            .data
+            or []
+        )
     except Exception:
         return empty_log
 
-    if log_df is None or log_df.empty:
+    if not movement_rows or not inventory_rows:
         return empty_log
 
-    trimmed = log_df.iloc[:, :5].copy()
-    while trimmed.shape[1] < 5:
-        trimmed[trimmed.shape[1]] = pd.NA
+    inventory_df = pd.DataFrame(inventory_rows)[["id", "item_code", "brand_name", "category"]]
+    movement_df = pd.DataFrame(movement_rows)
+    merged_df = movement_df.merge(inventory_df, left_on="item_id", right_on="id", how="left")
+    scope_categories = movement_scope_categories(log_worksheet_name)
+    merged_df = merged_df[merged_df["category"].isin(scope_categories)].copy()
+    if merged_df.empty:
+        return empty_log
 
-    trimmed.columns = ["vaccine_id", "brand_name", "stock_before", "doses_given", "timestamp"]
-    if first_log_row_is_header(trimmed):
-        trimmed = trimmed.iloc[1:].copy()
-    trimmed = trimmed.dropna(how="all")
+    merged_df["timestamp"] = pd.to_datetime(
+        merged_df["occurred_at"],
+        errors="coerce",
+        utc=True,
+        format="ISO8601",
+    ).dt.tz_localize(None)
+    merged_df = merged_df[merged_df["timestamp"].notna()].copy()
+    if merged_df.empty:
+        return empty_log
 
-    for column in ["vaccine_id", "brand_name", "timestamp"]:
-        trimmed[column] = trimmed[column].fillna("").astype(str).str.strip()
+    return (
+        merged_df.rename(
+            columns={
+                "item_code": "vaccine_id",
+                "quantity": "doses_given",
+            }
+        )[["vaccine_id", "brand_name", "stock_before", "doses_given", "timestamp"]]
+        .reset_index(drop=True)
+    )
 
-    trimmed["stock_before"] = pd.to_numeric(trimmed["stock_before"], errors="coerce")
-    trimmed["doses_given"] = pd.to_numeric(trimmed["doses_given"], errors="coerce").fillna(1)
-    trimmed["timestamp"] = trimmed["timestamp"].map(parse_log_timestamp)
-    trimmed = trimmed[trimmed["timestamp"].notna()].copy()
 
-    return trimmed.reset_index(drop=True)
-
-
-@st.cache_data(ttl=3600, show_spinner=False)
-def load_inventory_log_data_cached(_conn: GSheetsConnection, log_worksheet_name: str) -> pd.DataFrame:
+@st.cache_data(ttl=60, show_spinner=False)
+def load_inventory_log_data_cached(_conn: SupabaseConnection, log_worksheet_name: str) -> pd.DataFrame:
     return load_inventory_log_data(_conn, log_worksheet_name)
 
 
-def load_qr_base_url(conn: GSheetsConnection) -> str:
+def load_stock_movements(conn: SupabaseConnection) -> pd.DataFrame:
+    empty_df = pd.DataFrame(
+        columns=[
+            "brand_name",
+            "item_code",
+            "category",
+            "movement_type",
+            "quantity",
+            "stock_before",
+            "stock_after",
+            "timestamp",
+            "source",
+            "notes",
+        ]
+    )
+
     try:
-        config_worksheet = select_live_worksheet(conn, CONFIG_WORKSHEET_NAME)
-        value = str(config_worksheet.acell("A1").value or "").strip().rstrip("/")
+        inventory_rows = _query_inventory_rows(conn, include_inactive=True, ttl=0)
+        movement_rows = (
+            conn.table("stock_movements")
+            .select("item_id,movement_type,quantity,stock_before,stock_after,occurred_at,source,notes")
+            .order("occurred_at", desc=True)
+            .execute()
+            .data
+            or []
+        )
+    except Exception:
+        return empty_df
+
+    if not movement_rows or not inventory_rows:
+        return empty_df
+
+    inventory_df = pd.DataFrame(inventory_rows)[["id", "item_code", "brand_name", "category"]]
+    movement_df = pd.DataFrame(movement_rows)
+    merged_df = movement_df.merge(inventory_df, left_on="item_id", right_on="id", how="left")
+    merged_df["timestamp"] = pd.to_datetime(
+        merged_df["occurred_at"],
+        errors="coerce",
+        utc=True,
+        format="ISO8601",
+    ).dt.tz_localize(None)
+    merged_df["brand_name"] = merged_df["brand_name"].fillna("").astype(str).str.strip()
+    merged_df["item_code"] = merged_df["item_code"].fillna("").astype(str).str.strip()
+    merged_df["category"] = merged_df["category"].fillna("").astype(str).str.strip()
+    merged_df["source"] = merged_df["source"].fillna("").astype(str).str.strip()
+    merged_df["notes"] = merged_df["notes"].fillna("").astype(str).str.strip()
+
+    return (
+        merged_df[
+            [
+                "brand_name",
+                "item_code",
+                "category",
+                "movement_type",
+                "quantity",
+                "stock_before",
+                "stock_after",
+                "timestamp",
+                "source",
+                "notes",
+            ]
+        ]
+        .sort_values(["brand_name", "timestamp"], ascending=[True, False], na_position="last")
+        .reset_index(drop=True)
+    )
+
+
+@st.cache_data(ttl=60, show_spinner=False)
+def load_stock_movements_cached(_conn: SupabaseConnection) -> pd.DataFrame:
+    return load_stock_movements(_conn)
+
+
+def load_qr_base_url(conn: SupabaseConnection) -> str:
+    try:
+        rows = (
+            conn.table("app_config")
+            .select("value")
+            .eq("key", "qr_base_url")
+            .limit(1)
+            .execute()
+            .data
+            or []
+        )
+        if not rows:
+            return DEFAULT_APP_BASE_URL
+        value = str(rows[0].get("value") or "").strip().rstrip("/")
         return value or DEFAULT_APP_BASE_URL
-    except WorksheetNotFound:
-        return DEFAULT_APP_BASE_URL
     except Exception:
         return DEFAULT_APP_BASE_URL
 
 
-def save_qr_base_url(conn: GSheetsConnection, base_url: str) -> None:
-    config_worksheet = select_live_worksheet(conn, CONFIG_WORKSHEET_NAME)
-    config_worksheet.update_acell("A1", base_url)
+def save_qr_base_url(conn: SupabaseConnection, base_url: str) -> None:
+    conn.table("app_config").upsert({"key": "qr_base_url", "value": base_url}).execute()
 
 
 def fetch_inventory_snapshot(
-    conn: GSheetsConnection,
+    conn: SupabaseConnection,
     worksheet_name: str | None,
     *,
     cleaner: Callable[[pd.DataFrame | None], pd.DataFrame],
@@ -287,7 +367,9 @@ def fetch_inventory_snapshot(
     fallback_loader: Callable[[], pd.DataFrame] | None = None,
 ) -> StockSnapshot:
     try:
-        df = cleaner(conn.read(worksheet=worksheet_name, ttl=0))
+        categories = inventory_scope_categories(worksheet_name)
+        rows = _query_inventory_rows(conn, categories=categories, ttl=0)
+        df = cleaner(_inventory_rows_to_app_frame(rows))
         if df.empty:
             fallback_data = cleaner(fallback_loader()) if fallback_loader else cleaner(None)
             return StockSnapshot(
@@ -297,8 +379,8 @@ def fetch_inventory_snapshot(
             )
         return StockSnapshot(
             data=df,
-            source_kind="google",
-            message=":material/database_upload: Live data loaded from Google Sheets.",
+            source_kind="supabase",
+            message=":material/database_upload: Live data loaded from Supabase.",
         )
     except Exception as exc:
         fallback_data = cleaner(fallback_loader()) if fallback_loader else cleaner(None)
@@ -306,28 +388,108 @@ def fetch_inventory_snapshot(
             data=fallback_data,
             source_kind="sample" if fallback_loader else "warning",
             message=(
-                f"Google Sheets could not be read ({type(exc).__name__}). Showing the bundled sample dataset instead."
+                f"Supabase could not be read ({type(exc).__name__}). Showing the bundled sample dataset instead."
                 if fallback_loader
-                else f"Google Sheets could not be read ({type(exc).__name__})."
+                else f"Supabase could not be read ({type(exc).__name__})."
             ),
         )
 
 
-def fetch_snapshot(conn: GSheetsConnection, worksheet_name: str | None, fallback_loader: Callable[[], pd.DataFrame]) -> StockSnapshot:
+def load_live_inventory_frame(
+    conn: SupabaseConnection,
+    worksheet_name: str | None,
+    *,
+    cleaner: Callable[[pd.DataFrame | None], pd.DataFrame],
+) -> pd.DataFrame:
+    rows = _query_inventory_rows(conn, categories=inventory_scope_categories(worksheet_name), ttl=0)
+    return cleaner(_inventory_rows_to_app_frame(rows))
+
+
+def fetch_snapshot(conn: SupabaseConnection, worksheet_name: str | None, fallback_loader: Callable[[], pd.DataFrame]) -> StockSnapshot:
     return fetch_inventory_snapshot(
         conn,
         worksheet_name,
         cleaner=clean_stock_data,
-        empty_message="The Google Sheet is empty right now. Sample data has been loaded locally until you save.",
+        empty_message="The Supabase inventory is empty right now. Sample data has been loaded locally until you save.",
         fallback_loader=fallback_loader,
     )
 
 
-def fetch_consumables_snapshot(conn: GSheetsConnection) -> StockSnapshot:
+def fetch_consumables_snapshot(conn: SupabaseConnection) -> StockSnapshot:
     return fetch_inventory_snapshot(
         conn,
         CONSUMABLES_WORKSHEET_NAME,
         cleaner=clean_consumables_data,
-        empty_message="The consumables sheet is empty right now.",
+        empty_message="The consumables inventory is empty right now.",
         fallback_loader=None,
     )
+
+
+def sync_inventory_sheet(
+    conn: SupabaseConnection,
+    worksheet_name: str | None,
+    *,
+    target_df: pd.DataFrame,
+    cleaner: Callable[[pd.DataFrame | None], pd.DataFrame],
+    generic_column_name: str,
+) -> pd.DataFrame:
+    del generic_column_name
+
+    categories = inventory_scope_categories(worksheet_name)
+    default_category = "consumable" if categories == ["consumable"] else None
+    desired_df = cleaner(target_df)
+    current_rows = _query_inventory_rows(conn, categories=categories, include_inactive=True, ttl=0)
+
+    current_by_code = {str(row["item_code"]).strip(): row for row in current_rows}
+    current_active_codes = {
+        str(row["item_code"]).strip() for row in current_rows if bool(row.get("is_active"))
+    }
+    desired_codes = {
+        str(row["id"]).strip()
+        for _, row in desired_df.iterrows()
+        if str(row.get("id", "")).strip()
+    }
+
+    for _, row in desired_df.iterrows():
+        payload = _item_payload_from_row(row, default_category=default_category)
+        item_code = payload["item_code"]
+        existing = current_by_code.get(item_code)
+
+        if existing is None:
+            conn.table("inventory_items").insert(payload).execute()
+            continue
+
+        update_payload = {
+            "category": payload["category"],
+            "brand_name": payload["brand_name"],
+            "generic_name": payload["generic_name"],
+            "expiry_text": payload["expiry_text"],
+            "expected_monthly_use": payload["expected_monthly_use"],
+            "order_level": payload["order_level"],
+            "is_active": True,
+        }
+        stock_before = int(existing.get("current_stock") or 0)
+        stock_after = payload["current_stock"]
+        if stock_before != stock_after:
+            update_payload["current_stock"] = stock_after
+
+        conn.table("inventory_items").update(update_payload).eq("id", existing["id"]).execute()
+        if stock_before != stock_after:
+            _insert_movement(
+                conn,
+                item_id=existing["id"],
+                movement_type="adjustment",
+                quantity=abs(stock_after - stock_before),
+                stock_before=stock_before,
+                stock_after=stock_after,
+                source="stock_editor",
+                notes="Inventory editor stock change",
+            )
+
+    codes_to_deactivate = sorted(current_active_codes - desired_codes)
+    for item_code in codes_to_deactivate:
+        existing = current_by_code[item_code]
+        conn.table("inventory_items").update({"is_active": False}).eq("id", existing["id"]).execute()
+
+    refreshed_rows = _query_inventory_rows(conn, categories=categories, ttl=0)
+    return cleaner(_inventory_rows_to_app_frame(refreshed_rows))
