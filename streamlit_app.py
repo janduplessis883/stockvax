@@ -844,6 +844,7 @@ def render_stock_usage_plot(
     item_label: str,
     value_label: str,
     bar_size: int = 22,
+    y_axis_max: int | None = None,
     horizontal: bool = False,
     wrap_in_container: bool = False,
 ) -> None:
@@ -876,6 +877,11 @@ def render_stock_usage_plot(
             "Stock level": 0,
             "Expected monthly use": 1,
         }
+    )
+    long_plot_df["plot_value"] = (
+        long_plot_df["value"].clip(upper=y_axis_max)
+        if y_axis_max is not None
+        else long_plot_df["value"]
     )
 
     base_chart = alt.Chart(long_plot_df).mark_bar(size=bar_size).encode(
@@ -920,6 +926,7 @@ def render_stock_usage_plot(
             x=alt.X(
                 "sum(value):Q",
                 title=None,
+                scale=alt.Scale(domain=[0, y_axis_max], clamp=True) if y_axis_max is not None else alt.Undefined,
                 axis=alt.Axis(
                     labelColor=tick_color,
                     labelFontSize=11,
@@ -947,8 +954,9 @@ def render_stock_usage_plot(
                 ),
             ),
             y=alt.Y(
-                "sum(value):Q",
+                "sum(plot_value):Q",
                 title=None,
+                scale=alt.Scale(domain=[0, y_axis_max], clamp=True) if y_axis_max is not None else alt.Undefined,
                 axis=alt.Axis(
                     labelColor=tick_color,
                     labelFontSize=11,
@@ -1408,6 +1416,10 @@ def render_inventory_overview(
     log_worksheet_name: str,
     stock_chart_colors: tuple[str, str],
     activity_chart_colors: tuple[str, str],
+    stock_chart_bar_size: int = 22,
+    stock_chart_y_axis_max: int | None = None,
+    stock_chart_zoom_toggle_key: str | None = None,
+    stock_chart_zoom_toggle_label: str = "Zoomed",
     split_vaccine_categories: bool = False,
 ) -> None:
     render_metrics(stock_df, log_df, tracked_label=tracked_label, on_hand_label=on_hand_label)
@@ -1517,6 +1529,15 @@ def render_inventory_overview(
             value_label=value_label,
         )
     else:
+        active_stock_chart_y_axis_max = stock_chart_y_axis_max
+        if stock_chart_y_axis_max is not None and stock_chart_zoom_toggle_key is not None:
+            zoom_enabled = st.toggle(
+                stock_chart_zoom_toggle_label,
+                value=True,
+                key=stock_chart_zoom_toggle_key,
+                help=f"On zooms the y-axis to 0-{stock_chart_y_axis_max}. Off shows the full y-axis extent.",
+            )
+            active_stock_chart_y_axis_max = stock_chart_y_axis_max if zoom_enabled else None
         render_stock_usage_plot(
             stock_df,
             title=f"{section_title}: current stock vs expected monthly use",
@@ -1524,6 +1545,8 @@ def render_inventory_overview(
             empty_message=f"No {item_label_plural.lower()} data is available to plot yet.",
             item_label=section_title,
             value_label=value_label,
+            bar_size=stock_chart_bar_size,
+            y_axis_max=active_stock_chart_y_axis_max,
         )
     if not split_vaccine_categories:
         render_inventory_activity_plot(
@@ -1698,6 +1721,9 @@ def render_inventory_action_tab(
     on_click: Callable[[SupabaseConnection, str], None],
     chart_colors: tuple[str, str],
     chart_bar_size: int = 22,
+    chart_y_axis_max: int | None = None,
+    chart_zoom_toggle_key: str | None = None,
+    chart_zoom_toggle_label: str = "Zoomed",
     brand_font_size: str = "2.0rem",
     generic_font_size: str = "0.95rem",
     expiry_font_size: str = "1.5rem",
@@ -1705,6 +1731,19 @@ def render_inventory_action_tab(
 ) -> None:
     with st.expander(expander_title, icon=":material/bar_chart:"):
         stock_with_metrics = add_inventory_metrics(stock_df, cleaner=cleaner)
+        active_chart_y_axis_max = chart_y_axis_max
+        if (
+            not split_vaccine_categories
+            and chart_y_axis_max is not None
+            and chart_zoom_toggle_key is not None
+        ):
+            zoom_enabled = st.toggle(
+                chart_zoom_toggle_label,
+                value=True,
+                key=chart_zoom_toggle_key,
+                help=f"On zooms the y-axis to 0-{chart_y_axis_max}. Off shows the full y-axis extent.",
+            )
+            active_chart_y_axis_max = chart_y_axis_max if zoom_enabled else None
         if split_vaccine_categories:
             render_split_vaccine_stock_usage_plots(
                 stock_with_metrics,
@@ -1720,6 +1759,7 @@ def render_inventory_action_tab(
                 item_label=chart_item_label,
                 value_label="Units",
                 bar_size=chart_bar_size,
+                y_axis_max=active_chart_y_axis_max,
             )
     control_columns = st.columns([1, 1.35])
     with control_columns[0]:
@@ -1948,6 +1988,8 @@ def render_consumables_tab(conn: SupabaseConnection, stock_df: pd.DataFrame, log
         on_click=use_consumable,
         chart_colors=CONSUMABLE_STOCK_COLORS,
         chart_bar_size=12,
+        chart_y_axis_max=15,
+        chart_zoom_toggle_key="consumables_chart_zoom_toggle",
         brand_font_size="1.55rem",
         generic_font_size="0.82rem",
         expiry_font_size="1.2rem",
@@ -2966,6 +3008,9 @@ def render_app() -> None:
                 log_worksheet_name=CONSUMABLES_LOG_WORKSHEET_NAME,
                 stock_chart_colors=CONSUMABLE_STOCK_COLORS,
                 activity_chart_colors=CONSUMABLE_ACTIVITY_COLORS,
+                stock_chart_bar_size=12,
+                stock_chart_y_axis_max=15,
+                stock_chart_zoom_toggle_key="consumables_overview_chart_zoom_toggle",
             )
 
     with delivery_tab:
