@@ -63,20 +63,21 @@ def _query_inventory_rows(
     return response.data or []
 
 
-def _inventory_rows_to_app_frame(rows: list[dict[str, Any]]) -> pd.DataFrame:
+def _inventory_rows_to_app_frame(rows: list[dict[str, Any]], *, include_is_active: bool = False) -> pd.DataFrame:
     if not rows:
-        return pd.DataFrame(
-            columns=[
-                "id",
-                "brand_name",
-                "generic_name",
-                "expiry_date",
-                "stock_level",
-                "expected_monthly_use",
-                "order_level",
-                "category",
-            ]
-        )
+        columns = [
+            "id",
+            "brand_name",
+            "generic_name",
+            "expiry_date",
+            "stock_level",
+            "expected_monthly_use",
+            "order_level",
+            "category",
+        ]
+        if include_is_active:
+            columns.append("is_active")
+        return pd.DataFrame(columns=columns)
 
     df = pd.DataFrame(
         {
@@ -90,26 +91,33 @@ def _inventory_rows_to_app_frame(rows: list[dict[str, Any]]) -> pd.DataFrame:
             "category": [row.get("category", "") for row in rows],
         }
     )
+    if include_is_active:
+        df["is_active"] = [bool(row.get("is_active")) for row in rows]
     for column in ["id", "brand_name", "generic_name", "expiry_date", "category"]:
         if column in df.columns:
             df[column] = df[column].fillna("")
 
-    return df[
-        [
-            "id",
-            "brand_name",
-            "generic_name",
-            "expiry_date",
-            "stock_level",
-            "expected_monthly_use",
-            "order_level",
-            "category",
-        ]
-    ].copy()
+    ordered_columns = [
+        "id",
+        "brand_name",
+        "generic_name",
+        "expiry_date",
+        "stock_level",
+        "expected_monthly_use",
+        "order_level",
+        "category",
+    ]
+    if include_is_active:
+        ordered_columns.append("is_active")
+
+    return df[ordered_columns].copy()
 
 
 def _item_payload_from_row(row: pd.Series, *, default_category: str | None = None) -> dict[str, Any]:
     category = str(row.get("category", "")).strip() or (default_category or "")
+    is_active = row.get("is_active", True)
+    if pd.isna(is_active):
+        is_active = True
     return {
         "item_code": str(row.get("id", "")).strip(),
         "category": category,
@@ -119,7 +127,7 @@ def _item_payload_from_row(row: pd.Series, *, default_category: str | None = Non
         "current_stock": int(row.get("stock_level", 0)),
         "expected_monthly_use": int(row.get("expected_monthly_use", 0)),
         "order_level": int(row.get("order_level", 0)),
-        "is_active": True,
+        "is_active": bool(is_active),
     }
 
 
@@ -400,9 +408,16 @@ def load_live_inventory_frame(
     worksheet_name: str | None,
     *,
     cleaner: Callable[[pd.DataFrame | None], pd.DataFrame],
+    include_inactive: bool = False,
+    include_is_active: bool = False,
 ) -> pd.DataFrame:
-    rows = _query_inventory_rows(conn, categories=inventory_scope_categories(worksheet_name), ttl=0)
-    return cleaner(_inventory_rows_to_app_frame(rows))
+    rows = _query_inventory_rows(
+        conn,
+        categories=inventory_scope_categories(worksheet_name),
+        include_inactive=include_inactive,
+        ttl=0,
+    )
+    return cleaner(_inventory_rows_to_app_frame(rows, include_is_active=include_is_active))
 
 
 def fetch_snapshot(conn: SupabaseConnection, worksheet_name: str | None, fallback_loader: Callable[[], pd.DataFrame]) -> StockSnapshot:
@@ -444,10 +459,10 @@ def sync_inventory_sheet(
     current_active_codes = {
         str(row["item_code"]).strip() for row in current_rows if bool(row.get("is_active"))
     }
-    desired_codes = {
+    desired_active_codes = {
         str(row["id"]).strip()
         for _, row in desired_df.iterrows()
-        if str(row.get("id", "")).strip()
+        if str(row.get("id", "")).strip() and bool(row.get("is_active", True))
     }
 
     for _, row in desired_df.iterrows():
@@ -466,7 +481,7 @@ def sync_inventory_sheet(
             "expiry_text": payload["expiry_text"],
             "expected_monthly_use": payload["expected_monthly_use"],
             "order_level": payload["order_level"],
-            "is_active": True,
+            "is_active": payload["is_active"],
         }
         stock_before = int(existing.get("current_stock") or 0)
         stock_after = payload["current_stock"]
@@ -486,7 +501,7 @@ def sync_inventory_sheet(
                 notes="Inventory editor stock change",
             )
 
-    codes_to_deactivate = sorted(current_active_codes - desired_codes)
+    codes_to_deactivate = sorted(current_active_codes - desired_active_codes)
     for item_code in codes_to_deactivate:
         existing = current_by_code[item_code]
         conn.table("inventory_items").update({"is_active": False}).eq("id", existing["id"]).execute()

@@ -2,3 +2,4 @@ st-supabase-connection
 streamlit
 pandas
 resend
+numpy

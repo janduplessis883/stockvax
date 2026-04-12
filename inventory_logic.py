@@ -41,7 +41,7 @@ def empty_inventory_frame() -> pd.DataFrame:
 
 def row_has_content(row: pd.Series) -> bool:
     for column, value in row.items():
-        if column == "id":
+        if column in {"id", "is_active"}:
             continue
         if pd.isna(value):
             continue
@@ -66,6 +66,22 @@ def normalize_expiry_text(value: object) -> str:
         if 1 <= month <= 12:
             return digits
     return text
+
+
+def normalize_bool_value(value: object, *, default: bool = True) -> bool:
+    if pd.isna(value):
+        return default
+    if isinstance(value, (bool, np.bool_)):
+        return bool(value)
+
+    text = str(value).strip().casefold()
+    if text in {"", "nan", "none"}:
+        return default
+    if text in {"true", "t", "1", "yes", "y"}:
+        return True
+    if text in {"false", "f", "0", "no", "n"}:
+        return False
+    return default
 
 
 def make_unique_ids(values: pd.Series, blank_id_template: str) -> pd.Series:
@@ -172,6 +188,9 @@ def clean_inventory_data(
 
     for column in NUMBER_COLUMNS:
         df[column] = pd.to_numeric(df[column], errors="coerce").fillna(0).round().astype(int)
+
+    if "is_active" in df.columns:
+        df["is_active"] = df["is_active"].map(lambda value: normalize_bool_value(value, default=False))
 
     if id_generator is not None:
         df["id"] = id_generator(df)

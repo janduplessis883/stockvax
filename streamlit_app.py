@@ -7,6 +7,7 @@ from typing import Callable
 from urllib.parse import quote
 
 import altair as alt
+import numpy as np
 import pandas as pd
 import streamlit as st
 from st_supabase_connection import SupabaseConnection
@@ -1122,6 +1123,159 @@ def render_inventory_activity_plot(
     )
 
 
+def compact_delivery_label(name: str, quantity: int) -> str:
+    cleaned_name = str(name).strip()
+    if len(cleaned_name) > 18:
+        cleaned_name = f"{cleaned_name[:15].rstrip()}..."
+    return f"{cleaned_name} +{int(quantity)}"
+
+
+def render_delivery_timeline_plot(movement_df: pd.DataFrame) -> None:
+    delivery_df = movement_df[
+        (movement_df["movement_type"] == "delivery") & movement_df["timestamp"].notna()
+    ].copy()
+    if delivery_df.empty:
+        st.info("No deliveries have been recorded yet.")
+        return
+
+    delivery_df["brand_name"] = delivery_df["brand_name"].fillna("").astype(str).str.strip()
+    delivery_df["item_code"] = delivery_df["item_code"].fillna("").astype(str).str.strip()
+    delivery_df["category"] = delivery_df["category"].fillna("").astype(str).str.strip()
+    delivery_df["item_name"] = delivery_df["brand_name"].where(
+        delivery_df["brand_name"] != "",
+        delivery_df["item_code"],
+    )
+    delivery_df["quantity"] = pd.to_numeric(delivery_df["quantity"], errors="coerce").fillna(0).astype(int)
+    delivery_df = delivery_df[delivery_df["quantity"] > 0].copy()
+    if delivery_df.empty:
+        st.info("No deliveries with a recorded quantity are available to plot yet.")
+        return
+
+    category_palette = {
+        VACCINE_CATEGORY: "#ec5d4b",
+        EMERGENCY_DRUG_CATEGORY: "#d849ab",
+        "consumable": "#74a8d1",
+    }
+    category_labels = {
+        VACCINE_CATEGORY: "Vaccine",
+        EMERGENCY_DRUG_CATEGORY: "Emergency drug",
+        "consumable": "Consumable",
+    }
+
+    delivery_df = delivery_df.sort_values(["timestamp", "quantity", "item_name"], ascending=[True, False, True]).reset_index(drop=True)
+    delivery_df["category_label"] = delivery_df["category"].map(category_labels).fillna("Other")
+    delivery_df["label"] = [
+        compact_delivery_label(item_name, quantity)
+        for item_name, quantity in zip(delivery_df["item_name"], delivery_df["quantity"])
+    ]
+    text_color = st.get_option("theme.textColor") or "#0c1722"
+    grid_color = st.get_option("theme.borderColor") or "#d7ded8"
+    tick_color = "#7d8386"
+
+    base = alt.Chart(delivery_df).encode(
+        x=alt.X(
+            "timestamp:T",
+            title=None,
+            axis=alt.Axis(
+                format="%d %b",
+                labelAngle=-30,
+                labelColor=tick_color,
+                labelFontSize=11,
+                grid=False,
+                domain=False,
+                tickColor=grid_color,
+            ),
+        ),
+        y=alt.Y(
+            "quantity:Q",
+            title=None,
+            axis=alt.Axis(
+                labelColor=tick_color,
+                labelFontSize=11,
+                gridColor=grid_color,
+                domain=False,
+                tickColor=grid_color,
+            ),
+        ),
+        color=alt.Color(
+            "category_label:N",
+            scale=alt.Scale(
+                domain=["Vaccine", "Emergency drug", "Consumable"],
+                range=[
+                    category_palette[VACCINE_CATEGORY],
+                    category_palette[EMERGENCY_DRUG_CATEGORY],
+                    category_palette["consumable"],
+                ],
+            ),
+            legend=alt.Legend(
+                title=None,
+                orient="bottom",
+                direction="horizontal",
+                labelColor=tick_color,
+                symbolType="circle",
+            ),
+        ),
+        tooltip=[
+            alt.Tooltip("timestamp:T", title="Delivery time", format="%d %B %Y %H:%M"),
+            alt.Tooltip("item_name:N", title="Item"),
+            alt.Tooltip("category_label:N", title="Category"),
+            alt.Tooltip("quantity:Q", title="Delivered volume", format=".0f"),
+            alt.Tooltip("item_code:N", title="Item code"),
+        ],
+    )
+
+    bars = base.mark_bar(
+        size=6,
+        opacity=0.72,
+        cornerRadiusTopLeft=5,
+        cornerRadiusTopRight=5,
+    )
+    points = base.mark_circle(
+        opacity=0.95,
+        size=90,
+        stroke="white",
+        strokeWidth=1.5,
+    )
+    labels = base.mark_text(
+        align="left",
+        baseline="bottom",
+        dx=8,
+        dy=-4,
+        angle=315,
+        fontSize=11,
+        fontWeight="bold",
+        color=text_color,
+    ).encode(
+        text="label:N",
+    )
+
+    chart = (
+        alt.layer(bars, points, labels)
+        .properties(
+            title="Delivery timeline: stock received by date",
+            height=400,
+        )
+        .configure_title(
+            anchor="start",
+            color=text_color,
+            fontSize=18,
+            fontWeight="bold",
+        )
+        .configure_view(strokeOpacity=0)
+    )
+
+    total_volume = int(delivery_df["quantity"].sum())
+    active_days = int(delivery_df["timestamp"].dt.floor("D").nunique())
+    largest_delivery = delivery_df.loc[delivery_df["quantity"].idxmax()]
+
+    st.altair_chart(chart, width="stretch")
+    st.caption(
+        f"{total_volume} units delivered across {len(delivery_df)} recorded delivery event(s) on {active_days} day(s). "
+        f"Largest single delivery was {largest_delivery['item_name']} (+{int(largest_delivery['quantity'])}) "
+        f"on {largest_delivery['timestamp']:%d %b %Y}."
+    )
+
+
 def render_split_vaccine_stock_usage_plots(
     stock_df: pd.DataFrame,
     *,
@@ -1543,6 +1697,7 @@ def render_inventory_action_tab(
     button_key_prefix: str,
     on_click: Callable[[SupabaseConnection, str], None],
     chart_colors: tuple[str, str],
+    chart_bar_size: int = 22,
     brand_font_size: str = "2.0rem",
     generic_font_size: str = "0.95rem",
     expiry_font_size: str = "1.5rem",
@@ -1564,6 +1719,7 @@ def render_inventory_action_tab(
                 empty_message=empty_message,
                 item_label=chart_item_label,
                 value_label="Units",
+                bar_size=chart_bar_size,
             )
     control_columns = st.columns([1, 1.35])
     with control_columns[0]:
@@ -1791,6 +1947,7 @@ def render_consumables_tab(conn: SupabaseConnection, stock_df: pd.DataFrame, log
         button_key_prefix="use_consumable",
         on_click=use_consumable,
         chart_colors=CONSUMABLE_STOCK_COLORS,
+        chart_bar_size=12,
         brand_font_size="1.55rem",
         generic_font_size="0.82rem",
         expiry_font_size="1.2rem",
@@ -2036,6 +2193,9 @@ def render_delivery_tab(conn: SupabaseConnection, vaccine_df: pd.DataFrame, cons
     st.caption(
         "Enter delivered stock and save each section separately so vaccines, emergency drugs, and consumables are recorded independently."
     )
+    movement_df = load_stock_movements_cached(conn)
+    with st.container(border=True):
+        render_delivery_timeline_plot(movement_df)
 
     vaccine_category_series = vaccine_df.apply(resolve_stock_category, axis=1)
     vaccine_display_df = (
@@ -2194,6 +2354,24 @@ def render_editor_section(
     default_category: str | None = None,
 ) -> None:
     st.markdown(f"## {section_title}")
+    if "is_active" not in stock_df.columns:
+        stock_df = stock_df.copy()
+        stock_df["is_active"] = True
+
+    inactive_df = stock_df[~stock_df["is_active"].fillna(False).astype(bool)].copy()
+    if inactive_df.empty:
+        st.caption("Inactive items are only shown in the stock editor.")
+    else:
+        inactive_labels = [
+            f"{row['id']} ({row['brand_name'] or row['generic_name'] or 'Unnamed item'})"
+            for _, row in inactive_df.iterrows()
+        ]
+        st.caption(
+            "Inactive items shown here only: "
+            + ", ".join(inactive_labels)
+            + ". Tick `Is active` to reactivate them."
+        )
+
     raw_editor_columns = BASE_COLUMNS + [column for column in stock_df.columns if column not in BASE_COLUMNS]
     editable_columns: list[str] = []
     for column in raw_editor_columns:
@@ -2243,6 +2421,7 @@ def render_editor_section(
                 options=[VACCINE_CATEGORY, EMERGENCY_DRUG_CATEGORY, "consumable"],
                 required=False,
             ),
+            "is_active": st.column_config.CheckboxColumn("Is active"),
         },
     )
 
@@ -2323,13 +2502,39 @@ def render_editor_section(
 
 def render_editor(conn: SupabaseConnection, vaccine_df: pd.DataFrame, consumables_df: pd.DataFrame) -> None:
     st.write("Edit the tables below, add rows at the bottom if needed, then save each table back to Supabase.")
-    st.caption("IDs are generated automatically when blank. Use expiry format MMYY, for example 0328.")
+    st.caption(
+        "IDs are generated automatically when blank. Use expiry format MMYY, for example 0328. "
+        "Only the stock editor shows inactive items."
+    )
 
-    vaccine_only_df = vaccine_df[
-        vaccine_df[VACCINE_CATEGORY_COLUMN].fillna(VACCINE_CATEGORY) == VACCINE_CATEGORY
+    editor_vaccine_df = vaccine_df.copy()
+    editor_consumables_df = consumables_df.copy()
+    try:
+        editor_vaccine_df = load_live_inventory_frame(
+            conn,
+            selected_worksheet_name(),
+            cleaner=clean_stock_data,
+            include_inactive=True,
+            include_is_active=True,
+        )
+        editor_consumables_df = load_live_inventory_frame(
+            conn,
+            CONSUMABLES_WORKSHEET_NAME,
+            cleaner=clean_consumables_data,
+            include_inactive=True,
+            include_is_active=True,
+        )
+    except Exception:
+        if "is_active" not in editor_vaccine_df.columns:
+            editor_vaccine_df["is_active"] = True
+        if "is_active" not in editor_consumables_df.columns:
+            editor_consumables_df["is_active"] = True
+
+    vaccine_only_df = editor_vaccine_df[
+        editor_vaccine_df[VACCINE_CATEGORY_COLUMN].fillna(VACCINE_CATEGORY) == VACCINE_CATEGORY
     ].reset_index(drop=True)
-    emergency_drug_df = vaccine_df[
-        vaccine_df[VACCINE_CATEGORY_COLUMN].fillna(VACCINE_CATEGORY) == EMERGENCY_DRUG_CATEGORY
+    emergency_drug_df = editor_vaccine_df[
+        editor_vaccine_df[VACCINE_CATEGORY_COLUMN].fillna(VACCINE_CATEGORY) == EMERGENCY_DRUG_CATEGORY
     ].reset_index(drop=True)
 
     render_editor_section(
@@ -2344,7 +2549,7 @@ def render_editor(conn: SupabaseConnection, vaccine_df: pd.DataFrame, consumable
         generic_column_name="generic_name",
         save_button_label="Save vaccines to Supabase",
         download_file_name="stockvax_vaccines_snapshot.csv",
-        full_stock_df=vaccine_df,
+        full_stock_df=editor_vaccine_df,
         default_category=VACCINE_CATEGORY,
     )
     st.divider()
@@ -2360,13 +2565,13 @@ def render_editor(conn: SupabaseConnection, vaccine_df: pd.DataFrame, consumable
         generic_column_name="generic_name",
         save_button_label="Save emergency drugs to Supabase",
         download_file_name="stockvax_emergency_drugs_snapshot.csv",
-        full_stock_df=vaccine_df,
+        full_stock_df=editor_vaccine_df,
         default_category=EMERGENCY_DRUG_CATEGORY,
     )
     st.divider()
     render_editor_section(
         conn,
-        consumables_df,
+        editor_consumables_df,
         section_title=":material/clean_hands: Consumables",
         worksheet_name=CONSUMABLES_WORKSHEET_NAME,
         cleaner=clean_consumables_data,
@@ -2681,13 +2886,13 @@ def render_app() -> None:
     consumables_log_df = st.session_state.get(state_key("consumables", "log_data"), pd.DataFrame())
 
     navigation_options = [
-        "VACCINE | EMERGENCY Rx",
-        "CONSUMABLES",
-        "Vaccine | Emergency Rx overview",
-        "Consumables overview",
-        "Record delivery",
-        "Stock movements",
-        "Stock editor",
+        ":material/syringe: VACCINE | EMERGENCY Rx",
+        ":material/clean_hands: CONSUMABLES",
+        ":material/circle_circle: Vaccine | Emergency Rx overview",
+        ":material/circle_circle: Consumables overview",
+        ":material/package_2: Record delivery",
+        ":material/swap_horiz: Stock movements",
+        ":material/edit: Stock editor",
     ]
     if "active_section" not in st.session_state:
         st.session_state["active_section"] = navigation_options[0]
