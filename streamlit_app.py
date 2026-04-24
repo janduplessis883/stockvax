@@ -1138,6 +1138,31 @@ def compact_delivery_label(name: str, quantity: int) -> str:
     return f"{cleaned_name} +{int(quantity)}"
 
 
+def add_delivery_label_lanes(delivery_df: pd.DataFrame) -> pd.DataFrame:
+    delivery_df = delivery_df.copy()
+    delivery_df["delivery_day"] = delivery_df["timestamp"].dt.floor("D")
+    delivery_df["delivery_gap_days"] = (
+        delivery_df["delivery_day"].diff().dt.total_seconds().div(60 * 60 * 24)
+    )
+    delivery_df["label_cluster"] = (
+        delivery_df["delivery_gap_days"].isna() | (delivery_df["delivery_gap_days"] > 2)
+    ).cumsum()
+    delivery_df["label_lane"] = delivery_df.groupby("label_cluster").cumcount()
+    delivery_df["cluster_size"] = delivery_df.groupby("label_cluster")["label_cluster"].transform("size")
+    delivery_df["cluster_peak_quantity"] = delivery_df.groupby("label_cluster")["quantity"].transform("max")
+    delivery_df["same_quantity_rank"] = delivery_df.groupby(["label_cluster", "quantity"]).cumcount()
+
+    dense_label_quantity = (
+        delivery_df["cluster_peak_quantity"] + 9 + (delivery_df["label_lane"] * 10)
+    )
+    delivery_df["label_quantity"] = np.where(
+        delivery_df["cluster_size"] > 1,
+        dense_label_quantity,
+        delivery_df["quantity"] + 6 + (delivery_df["same_quantity_rank"] * 10),
+    )
+    return delivery_df
+
+
 def render_delivery_timeline_plot(movement_df: pd.DataFrame) -> None:
     delivery_df = movement_df[
         (movement_df["movement_type"] == "delivery") & movement_df["timestamp"].notna()
@@ -1171,6 +1196,7 @@ def render_delivery_timeline_plot(movement_df: pd.DataFrame) -> None:
     }
 
     delivery_df = delivery_df.sort_values(["timestamp", "quantity", "item_name"], ascending=[True, False, True]).reset_index(drop=True)
+    delivery_df = add_delivery_label_lanes(delivery_df)
     delivery_df["category_label"] = delivery_df["category"].map(category_labels).fillna("Other")
     delivery_df["label"] = [
         compact_delivery_label(item_name, quantity)
@@ -1244,21 +1270,42 @@ def render_delivery_timeline_plot(movement_df: pd.DataFrame) -> None:
         stroke="white",
         strokeWidth=1.5,
     )
+    label_connectors = alt.Chart(delivery_df).mark_rule(
+        opacity=0.35,
+        strokeWidth=1,
+    ).encode(
+        x="timestamp:T",
+        y=alt.Y("quantity:Q"),
+        y2="label_quantity:Q",
+        color=alt.Color(
+            "category_label:N",
+            scale=alt.Scale(
+                domain=["Vaccine", "Emergency drug", "Consumable"],
+                range=[
+                    category_palette[VACCINE_CATEGORY],
+                    category_palette[EMERGENCY_DRUG_CATEGORY],
+                    category_palette["consumable"],
+                ],
+            ),
+            legend=None,
+        ),
+    )
     labels = base.mark_text(
         align="left",
         baseline="bottom",
         dx=8,
         dy=-4,
-        angle=315,
+        angle=300,
         fontSize=11,
-        fontWeight="bold",
+        fontWeight="normal",
         color=text_color,
     ).encode(
+        y=alt.Y("label_quantity:Q"),
         text="label:N",
     )
 
     chart = (
-        alt.layer(bars, points, labels)
+        alt.layer(bars, points, label_connectors, labels)
         .properties(
             title="Delivery timeline: stock received by date",
             height=400,
@@ -2394,8 +2441,10 @@ def render_editor_section(
     download_file_name: str,
     full_stock_df: pd.DataFrame | None = None,
     default_category: str | None = None,
+    show_heading: bool = True,
 ) -> None:
-    st.markdown(f"## {section_title}")
+    if show_heading:
+        st.markdown(f"## {section_title}")
     if "is_active" not in stock_df.columns:
         stock_df = stock_df.copy()
         stock_df["is_active"] = True
@@ -2579,51 +2628,191 @@ def render_editor(conn: SupabaseConnection, vaccine_df: pd.DataFrame, consumable
         editor_vaccine_df[VACCINE_CATEGORY_COLUMN].fillna(VACCINE_CATEGORY) == EMERGENCY_DRUG_CATEGORY
     ].reset_index(drop=True)
 
-    render_editor_section(
-        conn,
-        vaccine_only_df,
-        section_title=":material/syringe: Vaccines",
-        worksheet_name=selected_worksheet_name(),
-        cleaner=clean_stock_data,
-        snapshot_applier=apply_snapshot,
-        editor_key="vaccine_stock_editor",
-        generic_name_label="Generic name",
-        generic_column_name="generic_name",
-        save_button_label="Save vaccines to Supabase",
-        download_file_name="stockvax_vaccines_snapshot.csv",
-        full_stock_df=editor_vaccine_df,
-        default_category=VACCINE_CATEGORY,
+    with st.expander("Vaccines", expanded=False, icon=":material/syringe:"):
+        render_editor_section(
+            conn,
+            vaccine_only_df,
+            section_title="Vaccines",
+            worksheet_name=selected_worksheet_name(),
+            cleaner=clean_stock_data,
+            snapshot_applier=apply_snapshot,
+            editor_key="vaccine_stock_editor",
+            generic_name_label="Generic name",
+            generic_column_name="generic_name",
+            save_button_label="Save vaccines to Supabase",
+            download_file_name="stockvax_vaccines_snapshot.csv",
+            full_stock_df=editor_vaccine_df,
+            default_category=VACCINE_CATEGORY,
+            show_heading=False,
+        )
+
+    with st.expander("Emergency drugs", expanded=False, icon=":material/ecg_heart:"):
+        render_editor_section(
+            conn,
+            emergency_drug_df,
+            section_title="Emergency drugs",
+            worksheet_name=selected_worksheet_name(),
+            cleaner=clean_stock_data,
+            snapshot_applier=apply_snapshot,
+            editor_key="emergency_stock_editor",
+            generic_name_label="Generic name",
+            generic_column_name="generic_name",
+            save_button_label="Save emergency drugs to Supabase",
+            download_file_name="stockvax_emergency_drugs_snapshot.csv",
+            full_stock_df=editor_vaccine_df,
+            default_category=EMERGENCY_DRUG_CATEGORY,
+            show_heading=False,
+        )
+
+    with st.expander("Consumables", expanded=False, icon=":material/clean_hands:"):
+        render_editor_section(
+            conn,
+            editor_consumables_df,
+            section_title="Consumables",
+            worksheet_name=CONSUMABLES_WORKSHEET_NAME,
+            cleaner=clean_consumables_data,
+            snapshot_applier=apply_consumables_snapshot,
+            editor_key="consumables_stock_editor",
+            generic_name_label="Generic name / description",
+            generic_column_name="generic_name_description",
+            save_button_label="Save consumables to Supabase",
+            download_file_name="stockvax_consumables_snapshot.csv",
+            default_category="consumable",
+            show_heading=False,
+        )
+
+
+def render_stock_movements_summary_plot(movement_df: pd.DataFrame) -> None:
+    plot_df = movement_df[movement_df["timestamp"].notna()].copy()
+    if plot_df.empty:
+        st.info("No dated stock movements are available to plot yet.")
+        return
+
+    plot_df["quantity"] = pd.to_numeric(plot_df["quantity"], errors="coerce").fillna(0)
+    plot_df["stock_before"] = pd.to_numeric(plot_df["stock_before"], errors="coerce")
+    plot_df["stock_after"] = pd.to_numeric(plot_df["stock_after"], errors="coerce")
+    plot_df["signed_units"] = plot_df["stock_after"] - plot_df["stock_before"]
+    fallback_signed_units = np.select(
+        [
+            plot_df["movement_type"].eq("delivery"),
+            plot_df["movement_type"].eq("consume"),
+        ],
+        [
+            plot_df["quantity"],
+            -plot_df["quantity"],
+        ],
+        default=plot_df["quantity"],
     )
-    st.divider()
-    render_editor_section(
-        conn,
-        emergency_drug_df,
-        section_title=":material/ecg_heart: Emergency drugs",
-        worksheet_name=selected_worksheet_name(),
-        cleaner=clean_stock_data,
-        snapshot_applier=apply_snapshot,
-        editor_key="emergency_stock_editor",
-        generic_name_label="Generic name",
-        generic_column_name="generic_name",
-        save_button_label="Save emergency drugs to Supabase",
-        download_file_name="stockvax_emergency_drugs_snapshot.csv",
-        full_stock_df=editor_vaccine_df,
-        default_category=EMERGENCY_DRUG_CATEGORY,
+    plot_df["signed_units"] = plot_df["signed_units"].fillna(pd.Series(fallback_signed_units, index=plot_df.index))
+    plot_df = plot_df[plot_df["signed_units"] != 0].copy()
+    if plot_df.empty:
+        st.info("Stock movements are available, but none changed the stock level.")
+        return
+
+    movement_labels = {
+        "delivery": "Delivered",
+        "consume": "Used",
+        "adjustment": "Adjusted",
+    }
+    plot_df["movement_label"] = plot_df["movement_type"].map(movement_labels).fillna(
+        plot_df["movement_type"].str.replace("_", " ").str.title()
     )
-    st.divider()
-    render_editor_section(
-        conn,
-        editor_consumables_df,
-        section_title=":material/clean_hands: Consumables",
-        worksheet_name=CONSUMABLES_WORKSHEET_NAME,
-        cleaner=clean_consumables_data,
-        snapshot_applier=apply_consumables_snapshot,
-        editor_key="consumables_stock_editor",
-        generic_name_label="Generic name / description",
-        generic_column_name="generic_name_description",
-        save_button_label="Save consumables to Supabase",
-        download_file_name="stockvax_consumables_snapshot.csv",
-        default_category="consumable",
+    plot_df["movement_day"] = plot_df["timestamp"].dt.floor("D")
+
+    daily_df = (
+        plot_df.groupby(["movement_day", "movement_label"], as_index=False)
+        .agg(
+            signed_units=("signed_units", "sum"),
+            movement_count=("signed_units", "size"),
+        )
+        .sort_values("movement_day")
+    )
+
+    text_color = st.get_option("theme.textColor") or "#0c1722"
+    grid_color = st.get_option("theme.borderColor") or "#d7ded8"
+    tick_color = "#7d8386"
+    movement_domain = ["Delivered", "Used", "Adjusted"]
+    movement_range = ["#ec5d4b", "#74a8d1", "#8e5db7"]
+
+    base = alt.Chart(daily_df).encode(
+        x=alt.X(
+            "movement_day:T",
+            title=None,
+            axis=alt.Axis(
+                format="%d %b",
+                labelAngle=-30,
+                labelColor=tick_color,
+                labelFontSize=11,
+                grid=False,
+                domain=False,
+                tickColor=grid_color,
+            ),
+        ),
+        y=alt.Y(
+            "signed_units:Q",
+            title="Net units moved",
+            scale=alt.Scale(domain=[-200, 200], clamp=True),
+            axis=alt.Axis(
+                labelColor=tick_color,
+                labelFontSize=11,
+                titleColor=tick_color,
+                gridColor=grid_color,
+                domain=False,
+                tickColor=grid_color,
+            ),
+        ),
+        color=alt.Color(
+            "movement_label:N",
+            scale=alt.Scale(domain=movement_domain, range=movement_range),
+            legend=alt.Legend(
+                title=None,
+                orient="bottom",
+                direction="horizontal",
+                labelColor=tick_color,
+                symbolType="circle",
+            ),
+        ),
+        tooltip=[
+            alt.Tooltip("movement_day:T", title="Date", format="%d %B %Y"),
+            alt.Tooltip("movement_label:N", title="Movement"),
+            alt.Tooltip("signed_units:Q", title="Net units", format="+.0f"),
+            alt.Tooltip("movement_count:Q", title="Events", format=".0f"),
+        ],
+    )
+
+    bars = base.mark_bar(
+        opacity=0.82,
+        cornerRadiusTopLeft=4,
+        cornerRadiusTopRight=4,
+    )
+    zero_line = alt.Chart(pd.DataFrame({"y": [0]})).mark_rule(
+        color=grid_color,
+        strokeWidth=1,
+    ).encode(y="y:Q")
+
+    chart = (
+        alt.layer(bars, zero_line)
+        .properties(
+            title="Daily stock movement summary",
+            height=320,
+        )
+        .configure_title(
+            anchor="start",
+            color=text_color,
+            fontSize=18,
+            fontWeight="bold",
+        )
+        .configure_view(strokeOpacity=0)
+    )
+
+    delivered_units = int(plot_df.loc[plot_df["signed_units"] > 0, "signed_units"].sum())
+    used_units = int(abs(plot_df.loc[plot_df["signed_units"] < 0, "signed_units"].sum()))
+    net_units = int(plot_df["signed_units"].sum())
+
+    st.altair_chart(chart, width="stretch")
+    st.caption(
+        f"{delivered_units} units added, {used_units} units removed, net movement {net_units:+d} units "
+        f"across {len(plot_df)} stock movement event(s)."
     )
 
 
@@ -2635,6 +2824,8 @@ def render_stock_movements_tab(conn: SupabaseConnection) -> None:
     if movement_df.empty:
         st.info("No stock movements have been recorded yet.")
         return
+
+    render_stock_movements_summary_plot(movement_df)
 
     st.dataframe(
         movement_df,
