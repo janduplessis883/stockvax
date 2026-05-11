@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+from difflib import SequenceMatcher
 import html
 import re
 from typing import Callable
@@ -44,6 +45,7 @@ from inventory_logic import (
     format_expiry_display,
     frames_match,
     load_sample_stock,
+    normalize_column_name,
     parse_expiry_date,
     resolve_stock_category,
     sort_inventory_cards,
@@ -192,6 +194,221 @@ def load_qr_base_url(conn: SupabaseConnection) -> str:
 
 def save_qr_base_url(conn: SupabaseConnection, base_url: str) -> None:
     backend_save_qr_base_url(conn, base_url)
+
+
+def normalize_vaccine_match_text(value: object) -> str:
+    text = str(value or "").casefold()
+    text = text.replace("&", " and ")
+    text = re.sub(r"\b(\d+)\s*-\s*(\d+)\b", r"\1\2", text)
+    text = re.sub(r"[^a-z0-9]+", " ", text)
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def strip_vaccination_base_name(value: object) -> str:
+    text = str(value or "").strip()
+    text = re.sub(r"\s+", " ", text)
+    text = re.sub(r"\b(booster|single|scheduled booster)\b.*$", "", text, flags=re.IGNORECASE).strip()
+    text = re.sub(r"\b\d+(st|nd|rd|th)?\b$", "", text, flags=re.IGNORECASE).strip()
+    text = re.sub(r"\s+-\s+", "-", text).strip(" -")
+
+    descriptive_markers = [
+        " vaccine ",
+        " vacc ",
+        " suspension ",
+        " powder ",
+        " inj ",
+        " injection ",
+    ]
+    lowered = f" {text.casefold()} "
+    marker_positions = [lowered.find(marker) for marker in descriptive_markers if lowered.find(marker) > 0]
+    if marker_positions:
+        text = text[: min(marker_positions)].strip(" -")
+
+    aliases = {
+        "infanrix hexa": "Infanrix-Hexa",
+        "prevenar-13": "Prevenar13",
+        "prevenar 13": "Prevenar13",
+        "proquad": "MMRV",
+        "bcg": "BCG",
+    }
+    return aliases.get(text.casefold(), text)
+
+
+def vaccination_csv_column(df: pd.DataFrame, candidates: set[str]) -> str | None:
+    normalized_columns = {normalize_column_name(column): column for column in df.columns}
+    for candidate in candidates:
+        if candidate in normalized_columns:
+            return normalized_columns[candidate]
+    return None
+
+
+def parse_weekly_vaccine_usage_csv(uploaded_file) -> pd.DataFrame:
+    if hasattr(uploaded_file, "seek"):
+        uploaded_file.seek(0)
+    raw_df = pd.read_csv(uploaded_file)
+    vaccine_column = vaccination_csv_column(
+        raw_df,
+        {"vaccination_type", "vaccine", "vaccine_type", "brand_name"},
+    )
+    count_column = vaccination_csv_column(
+        raw_df,
+        {"patient_count", "count", "quantity", "doses", "dose_count"},
+    )
+    if vaccine_column is None:
+        raise ValueError("The CSV must include a Vaccination type column.")
+
+    usage_df = raw_df.copy()
+    usage_df[vaccine_column] = usage_df[vaccine_column].fillna("").astype(str).str.strip()
+    usage_df = usage_df[usage_df[vaccine_column] != ""].copy()
+    if usage_df.empty:
+        raise ValueError("The CSV does not contain any vaccination rows.")
+
+    if count_column is None:
+        usage_df["doses_given"] = 1
+    else:
+        usage_df["doses_given"] = pd.to_numeric(usage_df[count_column], errors="coerce").fillna(0).round().astype(int)
+    usage_df = usage_df[usage_df["doses_given"] > 0].copy()
+    if usage_df.empty:
+        raise ValueError("The CSV does not contain any positive dose counts.")
+
+    usage_df["csv_vaccination_type"] = usage_df[vaccine_column]
+    usage_df["base_name"] = usage_df["csv_vaccination_type"].map(strip_vaccination_base_name)
+    return (
+        usage_df.groupby(["base_name", "csv_vaccination_type"], as_index=False)["doses_given"]
+        .sum()
+        .sort_values(["base_name", "csv_vaccination_type"])
+        .reset_index(drop=True)
+    )
+
+
+def build_vaccine_match_candidates(stock_df: pd.DataFrame) -> list[dict[str, object]]:
+    candidates: list[dict[str, object]] = []
+    for _, row in stock_df.iterrows():
+        category = resolve_stock_category(row)
+        if category == EMERGENCY_DRUG_CATEGORY:
+            continue
+        names = [
+            row.get("brand_name", ""),
+            row.get("generic_name", ""),
+            f"{row.get('brand_name', '')} {row.get('generic_name', '')}",
+        ]
+        keys = {normalize_vaccine_match_text(name) for name in names if str(name or "").strip()}
+        candidates.append(
+            {
+                "id": row["id"],
+                "brand_name": row.get("brand_name", ""),
+                "generic_name": row.get("generic_name", ""),
+                "stock_level": int(row.get("stock_level", 0)),
+                "keys": keys,
+            }
+        )
+    return candidates
+
+
+def match_vaccine_base_name(base_name: str, candidates: list[dict[str, object]]) -> dict[str, object] | None:
+    base_key = normalize_vaccine_match_text(base_name)
+    if not base_key:
+        return None
+
+    best_candidate: dict[str, object] | None = None
+    best_score = 0.0
+    for candidate in candidates:
+        for key in candidate["keys"]:
+            key_text = str(key)
+            if not key_text:
+                continue
+            if base_key == key_text:
+                score = 1.0
+            elif base_key in key_text or key_text in base_key:
+                score = 0.92
+            else:
+                score = SequenceMatcher(None, base_key, key_text).ratio()
+            if score > best_score:
+                best_candidate = candidate
+                best_score = score
+
+    if best_candidate is None or best_score < 0.78:
+        return None
+    return {**best_candidate, "match_score": best_score}
+
+
+def build_weekly_usage_preview(usage_df: pd.DataFrame, stock_df: pd.DataFrame) -> pd.DataFrame:
+    candidates = build_vaccine_match_candidates(stock_df)
+    preview_rows: list[dict[str, object]] = []
+    for base_name, group_df in usage_df.groupby("base_name", sort=True):
+        doses_given = int(group_df["doses_given"].sum())
+        match = match_vaccine_base_name(base_name, candidates)
+        row = {
+            "base_name": base_name,
+            "doses_given": doses_given,
+            "matched_item_id": "",
+            "matched_stock_item": "",
+            "current_stock": np.nan,
+            "stock_after": np.nan,
+            "status": "No stock match",
+        }
+        if match is not None:
+            current_stock = int(match["stock_level"])
+            row.update(
+                {
+                    "matched_item_id": match["id"],
+                    "matched_stock_item": match["brand_name"] or match["generic_name"],
+                    "current_stock": current_stock,
+                    "stock_after": current_stock - doses_given,
+                    "status": "Ready" if current_stock >= doses_given else "Not enough stock",
+                }
+            )
+        preview_rows.append(row)
+    return pd.DataFrame(preview_rows)
+
+
+def apply_weekly_vaccine_usage(conn: SupabaseConnection, preview_df: pd.DataFrame, uploaded_name: str) -> None:
+    ready_df = preview_df[preview_df["status"] == "Ready"].copy()
+    if ready_df.empty:
+        raise ValueError("There are no matched rows ready to apply.")
+
+    latest_df = load_live_inventory_frame(conn, selected_worksheet_name(), cleaner=clean_stock_data)
+    latest_by_id = {str(row["id"]): index for index, row in latest_df.iterrows()}
+    recorded_items: list[str] = []
+
+    for _, row in ready_df.iterrows():
+        item_id = str(row["matched_item_id"])
+        if item_id not in latest_by_id:
+            raise ValueError(f"{item_id} is no longer in the live stock list. Refresh and try again.")
+
+        row_index = latest_by_id[item_id]
+        quantity = int(row["doses_given"])
+        current_stock = int(latest_df.at[row_index, "stock_level"])
+        if quantity > current_stock:
+            item_name = latest_df.at[row_index, "brand_name"] or latest_df.at[row_index, "generic_name"] or item_id
+            raise ValueError(f"{item_name} only has {current_stock} in stock, but the CSV contains {quantity}.")
+
+        updated_row = apply_inventory_movement(
+            conn,
+            item_code=item_id,
+            quantity=quantity,
+            movement_type="consume",
+            source="weekly_csv_upload",
+            notes=f"{uploaded_name}: {row['base_name']}",
+        )
+        latest_df.at[row_index, "stock_level"] = int(updated_row["current_stock"])
+        recorded_items.append(f"{row['matched_stock_item']} (-{quantity})")
+
+    load_inventory_log_data_cached.clear()
+    load_stock_movements_cached.clear()
+    apply_snapshot(
+        StockSnapshot(
+            data=latest_df,
+            source_kind="supabase",
+            message="Live data loaded from Supabase.",
+        ),
+    )
+    st.session_state[state_key("vaccine", "log_data")] = load_inventory_log_data(conn, LOG_WORKSHEET_NAME)
+    set_flash(
+        "success",
+        f"Weekly CSV applied: {', '.join(recorded_items[:6])}.",
+        icon=":material/check_circle:",
+    )
 
 
 def queue_qr_base_url_input_sync(base_url: str) -> None:
@@ -377,6 +594,64 @@ def show_sidebar_status_badges() -> None:
         st.session_state.pop("flash", None)
         st.success(flash["message"], icon=flash.get("icon"))
     source_banner()
+
+
+def render_weekly_csv_sidebar(conn: SupabaseConnection) -> None:
+    with st.sidebar.expander("Weekly vaccine CSV", icon=":material/upload_file:"):
+        uploaded_file = st.file_uploader(
+            "Upload weekly vaccine CSV",
+            type=["csv"],
+            key="weekly_vaccine_csv_upload",
+            help="Upload the Friday-to-Thursday vaccination export. Friday's incomplete data can be left for the next run.",
+        )
+        if uploaded_file is None:
+            st.caption("The upload is previewed first, then saved only when you apply it.")
+            return
+
+        try:
+            usage_df = parse_weekly_vaccine_usage_csv(uploaded_file)
+            latest_df = load_live_inventory_frame(conn, selected_worksheet_name(), cleaner=clean_stock_data)
+            preview_df = build_weekly_usage_preview(usage_df, latest_df)
+        except Exception as exc:
+            st.error(f"Could not read this CSV: {exc}", icon=":material/error:")
+            return
+
+        total_doses = int(preview_df["doses_given"].sum())
+        matched_count = int(preview_df["matched_item_id"].astype(str).str.strip().ne("").sum())
+        st.caption(f"{total_doses} doses found across {len(preview_df)} base vaccine names. {matched_count} matched to stock.")
+
+        display_df = preview_df.rename(
+            columns={
+                "base_name": "CSV base name",
+                "doses_given": "Doses",
+                "matched_stock_item": "Stock item",
+                "current_stock": "Current",
+                "stock_after": "After",
+                "status": "Status",
+            }
+        )[["CSV base name", "Doses", "Stock item", "Current", "After", "Status"]]
+        st.dataframe(display_df, hide_index=True, width="stretch")
+
+        blocking_rows = preview_df[preview_df["status"] != "Ready"]
+        apply_disabled = not blocking_rows.empty
+        if apply_disabled:
+            st.warning(
+                "Fix unmatched rows or stock shortages before applying this CSV.",
+                icon=":material/warning:",
+            )
+
+        if st.button(
+            "Apply weekly usage",
+            type="primary",
+            icon=":material/syringe:",
+            disabled=apply_disabled,
+            width="stretch",
+        ):
+            try:
+                apply_weekly_vaccine_usage(conn, preview_df, uploaded_file.name)
+            except Exception as exc:
+                set_flash("error", f"Could not apply the weekly CSV: {exc}", icon=":material/error:")
+            st.rerun()
 
 
 def show_toast_message() -> None:
@@ -667,6 +942,8 @@ def render_sidebar(conn: SupabaseConnection) -> None:
         args=(conn,),
         placeholder=DEFAULT_APP_BASE_URL,
     )
+
+    render_weekly_csv_sidebar(conn)
 
     refresh_clicked = st.sidebar.button("Refresh from Supabase", width="stretch")
 
